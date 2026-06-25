@@ -3,7 +3,7 @@
 PHANTOM v4.0 - ULTIMATE Web Vulnerability Scanner
 Flask Web App | Render.com | All 20+ Modules
 """
-import base64,json,math,os,re,socket,ssl,threading,time,uuid,warnings
+import base64,hashlib,hmac,json,math,os,re,socket,ssl,threading,time,uuid,warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from datetime import datetime
@@ -98,6 +98,20 @@ class CVSSv31:
         "Cacheable Sensitive Page":dict(av="N",ac="H",pr="N",ui="N",s="U",c="L",i="N",a="N"),
         "WebSocket Vulnerability":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="L",a="N"),
         "Missing security.txt":dict(av="N",ac="L",pr="N",ui="N",s="U",c="N",i="N",a="N"),
+        "XPath Injection":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="L",a="N"),
+        "LDAP Injection":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="L",a="N"),
+        "Expression Language Injection":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="H"),
+        "Stored XSS":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="N"),
+        "User Enumeration":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "Unrestricted File Upload":dict(av="N",ac="L",pr="L",ui="N",s="C",c="H",i="H",a="H"),
+        "Backup File Exposed":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
+        "Source Code Disclosure":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
+        "Web Cache Deception":dict(av="N",ac="H",pr="N",ui="R",s="C",c="H",i="N",a="N"),
+        "Session Fixation":dict(av="N",ac="H",pr="N",ui="R",s="U",c="H",i="L",a="N"),
+        "Weak JWT Secret":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="N"),
+        "Hidden Parameter":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "Forced Browsing":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="N"),
+        "Verbose Error Disclosure":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -448,6 +462,31 @@ DESER_MARKERS={
 }
 HTTP_METHODS_TEST=["OPTIONS","PUT","DELETE","TRACE","TRACK","CONNECT","PATCH","PROPFIND"]
 LOG4SHELL_HEADERS=["User-Agent","Referer","X-Api-Version","X-Forwarded-For"]
+
+# ── Round-2 payloads ──────────────────────────────────────────────────────────
+# Unique arithmetic marker (7*73*11*... unlikely to occur naturally): 1337*1337=1787569
+SSTI_MARKER="1787569"
+SSTI_TEMPLATE_PAYLOADS=["{{1337*1337}}","{1337*1337}","<%= 1337*1337 %>","@(1337*1337)",
+    "#set($x=1337*1337)$x","{{= 1337*1337}}","[[1337*1337]]"]
+EL_PAYLOADS=["${1337*1337}","#{1337*1337}","%{1337*1337}","${{1337*1337}}","#{1337*1337}",
+    "%{(1337*1337)}","T(java.lang.Math).max(1787568,1787569)"]
+XPATH_PAYLOADS=["' or '1'='1","') or ('1'='1","' or 1=1 or ''='","x' or name()='username' or 'x'='y",
+    "']|//*|//user['"]
+XPATH_ERRORS=["xpath","xpathexception","sablotron","xmldom","libxml","unclosed token",
+    "expression must evaluate","syntaxerror.*xpath"]
+LDAP_PAYLOADS=["*","*)(uid=*))(|(uid=*","*)(&","*))%00","admin)(|(password=*)","*)(objectClass=*"]
+LDAP_ERRORS=["javax.naming","ldap","invalid dn syntax","com.sun.jndi","supplied argument is not a valid ldap",
+    "protocol error","invalidsearchfilter","bad search filter"]
+BACKUP_EXTS=["~",".bak",".old",".orig",".save",".swp",".swo",".tmp",".copy",".1",
+    ".backup",".zip",".tar.gz",".tar",".rar",".7z","%7E"]
+SOURCE_EXTS=[".php~",".php.bak",".php.old",".inc",".java",".cs",".rb~",".py~",".jsp.bak",".asp.bak"]
+STORED_XSS_MARKER="phantomStoredXSS7q9"
+EMAIL_TEST_USERS=["admin","administrator","test","root","user","support"]
+WEAK_JWT_SECRETS=["secret","secretkey","secret123","password","admin","key","jwt","token",
+    "changeme","123456","qwerty","s3cr3t","mysecret","supersecret","jwtsecret","your-256-bit-secret",
+    "test","dev","private","signature","HS256","default","app","api","auth","sign","verysecret"]
+HIDDEN_PARAMS=["debug","test","admin","is_admin","isadmin","role","access","edit","preview",
+    "show","display","mode","env","source","raw","internal","beta","feature","override","bypass"]
 VULN_IMPACT={
     "SQL Injection":"Full DB compromise — read/modify/delete, RCE via INTO OUTFILE",
     "SQL Injection (Form)":"Full DB compromise via form input",
@@ -514,6 +553,20 @@ VULN_IMPACT={
     "Cacheable Sensitive Page":"Private page cached by proxy/CDN — data leaks to other users",
     "WebSocket Vulnerability":"Cross-site WebSocket hijacking or unauthenticated WS access",
     "Missing security.txt":"No RFC 9116 security.txt — slows responsible disclosure",
+    "XPath Injection":"Bypass XML/XPath auth, extract entire XML data store",
+    "LDAP Injection":"Auth bypass and directory enumeration via LDAP filter injection",
+    "Expression Language Injection":"Remote Code Execution via SpEL/OGNL/EL evaluation",
+    "Stored XSS":"Persistent script runs for every visitor — mass session/credential theft",
+    "User Enumeration":"Valid usernames leaked via response differences — aids brute-force",
+    "Unrestricted File Upload":"Upload web shell — Remote Code Execution and full server compromise",
+    "Backup File Exposed":"Editor/VCS backup leaks source code, credentials and logic",
+    "Source Code Disclosure":"Server-side source revealed — secrets and logic exposed",
+    "Web Cache Deception":"Trick cache into storing a victim's private page for the attacker",
+    "Session Fixation":"Attacker fixes a session ID then rides the victim's authenticated session",
+    "Weak JWT Secret":"HMAC secret cracked — forge any token, full account/role takeover",
+    "Hidden Parameter":"Undocumented parameter alters behaviour — debug/admin features reachable",
+    "Forced Browsing":"Protected page reachable without authentication — access-control bypass",
+    "Verbose Error Disclosure":"Stack trace leaks framework, paths and queries — aids exploitation",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -559,6 +612,20 @@ VULN_FIX={
     "Cacheable Sensitive Page":["Set Cache-Control: no-store, private on authenticated pages","Add Pragma: no-cache","Never cache personalised responses at the CDN"],
     "WebSocket Vulnerability":["Validate the Origin header on the WS handshake","Authenticate every WebSocket connection","Use wss:// (TLS) only"],
     "Missing security.txt":["Publish /.well-known/security.txt per RFC 9116","Include a security contact and disclosure policy"],
+    "XPath Injection":["Use parameterized XPath / precompiled queries","Whitelist and escape user input","Avoid building XPath from raw strings"],
+    "LDAP Injection":["Escape LDAP special chars per RFC 4515","Use the framework's LDAP encoding API","Bind with a least-privilege service account"],
+    "Expression Language Injection":["Never evaluate user input as an expression","Disable SpEL/OGNL on untrusted data","Patch Struts/Spring to fixed versions"],
+    "Stored XSS":["Output-encode stored data on render","Sanitize on input with an allow-list","Enforce a strict Content-Security-Policy"],
+    "User Enumeration":["Return identical messages for invalid user vs password","Use constant-time responses","Rate-limit and CAPTCHA the login/reset flows"],
+    "Unrestricted File Upload":["Validate type by content, not extension","Store uploads outside webroot and rename","Disable script execution in the upload directory"],
+    "Backup File Exposed":["Remove editor/VCS backups from the webroot","Block ~ .bak .old .swp via server config","Add them to deployment ignore lists"],
+    "Source Code Disclosure":["Ensure handlers execute, not serve, source","Block source extensions at the web server","Move logic outside the document root"],
+    "Web Cache Deception":["Don't cache based on extension alone","Honour Cache-Control on dynamic responses","Match Content-Type to cache rules"],
+    "Session Fixation":["Regenerate the session ID on login","Reject client-supplied session IDs","Set Secure/HttpOnly/SameSite on session cookies"],
+    "Weak JWT Secret":["Use a long, random, high-entropy signing key","Prefer RS256/ES256 over HS256","Rotate secrets and reject alg:none"],
+    "Hidden Parameter":["Remove debug/admin parameters from production","Enforce server-side authorization on every feature","Audit parameter handling"],
+    "Forced Browsing":["Enforce authentication and authorization server-side","Never rely on hidden URLs for protection","Default-deny on protected routes"],
+    "Verbose Error Disclosure":["Disable debug mode in production","Return generic error pages","Log details server-side only"],
 }
 
 
@@ -2480,12 +2547,385 @@ def mod_well_known(job):
                  evidence="No RFC 9116 security.txt found — no machine-readable disclosure contact")
 
 
+# ══ ROUND-2 VULNERABILITY MODULES (deep coverage) ════════════════════════════
+
+# ── Module AN: Multi-engine SSTI (arithmetic-marker confirmed) ────────────────
+def mod_ssti_advanced(job, url):
+    """Confirms server-side template injection by forcing 1337*1337=1787569."""
+    params = dict(parse_qsl(urlparse(url).query))
+    if not params:
+        return
+    for param in list(params)[:6]:
+        for payload in SSTI_TEMPLATE_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp)
+            if r and SSTI_MARKER in r.text and payload not in r.text:
+                job.add_vuln("SSTI", url, param=param, payload=payload,
+                             evidence=f"Template engine evaluated {payload} -> {SSTI_MARKER} (RCE-class)")
+                job.chain(f"SSTI on {param} -> template engine executes expressions -> path to RCE")
+                return
+
+
+# ── Module AO: Expression Language / OGNL / SpEL injection ─────────────────────
+def mod_el_injection(job, url):
+    params = dict(parse_qsl(urlparse(url).query))
+    if not params:
+        return
+    for param in list(params)[:6]:
+        for payload in EL_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp)
+            if r and SSTI_MARKER in r.text and payload not in r.text:
+                job.add_vuln("Expression Language Injection", url, param=param, payload=payload,
+                             evidence=f"EL/OGNL/SpEL evaluated {payload} -> {SSTI_MARKER} — RCE likely (Struts/Spring)")
+                job.chain(f"EL injection on {param} -> expression evaluation -> remote code execution")
+                return
+
+
+# ── Module AP: XPath & LDAP Injection ─────────────────────────────────────────
+def mod_xpath_ldap(job, url):
+    params = dict(parse_qsl(urlparse(url).query))
+    if not params:
+        return
+    base = job.req(url)
+    base_len = len(base.text) if base else 0
+    for param in list(params)[:6]:
+        for payload in XPATH_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp)
+            if not r:
+                continue
+            low = r.text.lower()
+            if any(re.search(e, low) for e in XPATH_ERRORS):
+                job.add_vuln("XPath Injection", url, param=param, payload=payload,
+                             evidence="XPath/XML parser error reflected — XPath injection")
+                break
+        for payload in LDAP_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp)
+            if not r:
+                continue
+            low = r.text.lower()
+            if any(e in low for e in LDAP_ERRORS):
+                job.add_vuln("LDAP Injection", url, param=param, payload=payload,
+                             evidence="LDAP filter error reflected — LDAP injection")
+                break
+
+
+# ── Module AQ: Stored / Persistent XSS ────────────────────────────────────────
+def mod_stored_xss(job):
+    """Submit a unique benign marker through forms, then look for it un-encoded."""
+    marker = STORED_XSS_MARKER
+    probe  = f"<b id={marker}>x</b>"
+    submitted = False
+    for form in job.forms:
+        if form["method"] != "POST":
+            continue
+        data = {}
+        for name in form["inputs"]:
+            ln = name.lower()
+            if any(k in ln for k in ("csrf", "token", "captcha")):
+                data[name] = ""
+            elif "email" in ln:
+                data[name] = f"{marker}@example.com"
+            else:
+                data[name] = probe
+        if not data:
+            continue
+        job.req(form["action"], method="POST", data=data)
+        submitted = True
+    if not submitted:
+        return
+    # Re-crawl known pages and hunt for the raw, un-encoded marker
+    pages = [job.url] + list(job.urls)[:30]
+    for u in pages:
+        r = job.req(u)
+        if r and probe in r.text:
+            job.add_vuln("Stored XSS", u, payload=probe,
+                         evidence=f"Injected markup persisted un-encoded on {u} — persistent XSS")
+            job.chain("Stored XSS -> payload runs for every visitor -> mass session theft")
+            return
+        if r and marker in r.text and ("&lt;" not in r.text.split(marker)[0][-6:]):
+            job.add_vuln("Stored XSS", u, payload=marker,
+                         evidence=f"Marker reflected on {u} without HTML-encoding — likely persistent XSS")
+            return
+
+
+# ── Module AR: Username Enumeration ───────────────────────────────────────────
+def mod_user_enum(job):
+    login_paths = ["/login", "/signin", "/api/login", "/auth/login", "/account/login",
+                   "/forgot-password", "/password/reset", "/reset"]
+    field_user = ["username", "user", "email", "login"]
+    field_pass = ["password", "pass", "pwd"]
+    for path in login_paths:
+        target = job.url.rstrip("/") + path
+        r0 = job.req(target)
+        if not r0 or r0.status_code >= 400:
+            continue
+        # forge two attempts: clearly-fake user vs a plausible one
+        def attempt(uname):
+            data = {f: uname for f in field_user}
+            data.update({f: "WrongPass!9123" for f in field_pass})
+            rr = job.req(target, method="POST", data=data)
+            return rr
+
+        r_bad  = attempt("zzdoesnotexist_phantom9q")
+        r_good = attempt("admin")
+        if not (r_bad and r_good):
+            continue
+        diff_len  = abs(len(r_bad.text) - len(r_good.text))
+        diff_code = r_bad.status_code != r_good.status_code
+        signals   = ["no such user", "user not found", "unknown user", "no account",
+                     "incorrect password", "wrong password", "invalid password"]
+        bad_sig   = [s for s in signals if s in r_bad.text.lower()]
+        good_sig  = [s for s in signals if s in r_good.text.lower()]
+        if diff_code or diff_len > 120 or set(bad_sig) != set(good_sig):
+            job.add_vuln("User Enumeration", target,
+                         evidence=f"Login responses differ for valid vs invalid user (Δlen={diff_len}, codes {r_bad.status_code}/{r_good.status_code}) — usernames enumerable")
+            return
+
+
+# ── Module AS: Unrestricted File Upload (surface detection) ───────────────────
+def mod_file_upload(job):
+    r = job.req(job.url)
+    forms_html = [r.text] if r else []
+    for u in list(job.urls)[:20]:
+        rr = job.req(u)
+        if rr:
+            forms_html.append(rr.text)
+    for html in forms_html:
+        for fm in re.finditer(r"<form[^>]*>(.*?)</form>", html, re.S | re.I):
+            block = fm.group(0)
+            if re.search(r'type\s*=\s*["\']?file', block, re.I):
+                restricted = bool(re.search(r'accept\s*=', block, re.I))
+                act = re.search(r'action\s*=\s*["\']([^"\']+)', block, re.I)
+                where = urljoin(job.url, act.group(1)) if act else job.url
+                job.add_vuln("Unrestricted File Upload", where,
+                             evidence="File-upload form found"
+                                      + (" (no accept filter)" if not restricted else "")
+                                      + " — verify server-side type/extension validation & webroot isolation")
+                job.chain("File upload reachable -> if server-side validation is weak -> web shell -> RCE")
+                return
+
+
+# ── Module AT: Backup & Source-code disclosure ────────────────────────────────
+def mod_backup_files(job):
+    seeds = set()
+    base = job.url.rstrip("/")
+    for u in list(job.urls)[:25]:
+        path = urlparse(u).path
+        if path and path not in ("/", ""):
+            seeds.add(path)
+    seeds.update(["/index.php", "/index.html", "/config.php", "/app.py", "/main.py",
+                  "/wp-config.php", "/web.config", "/settings.py", "/.env"])
+    candidates = []
+    for p in list(seeds)[:25]:
+        for ext in BACKUP_EXTS:
+            candidates.append(base + p + ext)
+        candidates.append(base + p + ".save")
+    for ext in SOURCE_EXTS:
+        candidates.append(base + "/index" + ext)
+
+    def probe(u):
+        r = job.req(u, allow_redirects=False)
+        if r and r.status_code == 200 and len(r.text) > 0:
+            low = r.text.lower()
+            looks_code = any(s in low for s in ["<?php", "import ", "def ", "function ",
+                             "password", "secret", "connectionstring", "<configuration"])
+            return u, looks_code, len(r.text)
+        return None
+
+    found = 0
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(probe, u) for u in candidates[:120]]):
+            res = fut.result()
+            if not res:
+                continue
+            u, looks_code, ln = res
+            vt = "Source Code Disclosure" if (looks_code and any(u.endswith(e) for e in SOURCE_EXTS)) \
+                 else "Backup File Exposed"
+            job.add_vuln(vt, u,
+                         evidence=f"HTTP 200 — {ln}B of "
+                                  + ("source code/config" if looks_code else "backup content")
+                                  + " accessible")
+            if looks_code:
+                job.chain(f"Backup/source disclosure at {u} -> read logic & embedded credentials")
+            found += 1
+            if found >= 6:
+                return
+
+
+# ── Module AU: Web Cache Deception ────────────────────────────────────────────
+def mod_web_cache_deception(job):
+    paths = ["/account", "/profile", "/settings", "/dashboard", "/my-account", "/user"]
+    for p in paths:
+        real = job.url.rstrip("/") + p
+        r0 = job.req(real, allow_redirects=False)
+        if not r0 or r0.status_code not in (200, 301, 302):
+            continue
+        for fake in [p + "/phantom.css", p + "/phantom.js", p + ".css"]:
+            tricked = job.url.rstrip("/") + fake
+            r = job.req(tricked, allow_redirects=False)
+            if not r:
+                continue
+            cc  = r.headers.get("Cache-Control", "").lower()
+            xc  = (r.headers.get("X-Cache", "") + r.headers.get("CF-Cache-Status", "")).lower()
+            cacheable = ("no-store" not in cc and "private" not in cc) or "hit" in xc
+            if r.status_code == 200 and cacheable and len(r.text) > 200:
+                job.add_vuln("Web Cache Deception", tricked,
+                             evidence=f"Static-looking URL returns dynamic page and is cacheable (CC='{cc or 'none'}', X-Cache='{xc or 'none'}') — cache deception")
+                return
+
+
+# ── Module AV: JWT attacks (alg:none + weak HMAC secret crack) ─────────────────
+def mod_jwt_attacks(job):
+    jwt_re = r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    tokens = set()
+    for u in [job.url] + list(job.urls)[:10]:
+        r = job.req(u)
+        if not r:
+            continue
+        blob = r.text + str(dict(r.headers)) + str(r.cookies.get_dict())
+        tokens.update(re.findall(jwt_re, blob))
+    for tok in list(tokens)[:5]:
+        parts = tok.split(".")
+        if len(parts) != 3:
+            continue
+        try:
+            hdr = json.loads(base64.urlsafe_b64decode(parts[0] + "=="))
+        except Exception:
+            continue
+        alg = str(hdr.get("alg", "")).upper()
+        if alg == "NONE":
+            job.add_vuln("Weak JWT Secret", job.url, payload=tok[:32] + "...",
+                         evidence="JWT uses alg:none — signature not verified, tokens fully forgeable")
+            continue
+        if alg.startswith("HS"):
+            signing_input = (parts[0] + "." + parts[1]).encode()
+            try:
+                sig = base64.urlsafe_b64decode(parts[2] + "==")
+            except Exception:
+                continue
+            digest = {"HS256": hashlib.sha256, "HS384": hashlib.sha384,
+                      "HS512": hashlib.sha512}.get(alg, hashlib.sha256)
+            for secret in WEAK_JWT_SECRETS:
+                calc = hmac.new(secret.encode(), signing_input, digest).digest()
+                if hmac.compare_digest(calc, sig):
+                    job.add_vuln("Weak JWT Secret", job.url, payload=f"secret='{secret}'",
+                                 evidence=f"JWT HMAC secret cracked: '{secret}' — forge any token / privilege escalation",
+                                 extracted={"algorithm": alg, "cracked_secret": secret})
+                    job.chain(f"Weak JWT secret '{secret}' -> forge admin token -> full account takeover")
+                    break
+
+
+# ── Module AW: Hidden parameter mining ────────────────────────────────────────
+def mod_param_mining(job, url):
+    parsed = urlparse(url)
+    params = dict(parse_qsl(parsed.query))
+    base = job.req(url)
+    if not base:
+        return
+    base_len = len(base.text)
+    canary = "phantomCanary42"
+    for hp in HIDDEN_PARAMS:
+        if hp in params:
+            continue
+        tp = params.copy(); tp[hp] = canary
+        r = job.req(url, params=tp)
+        if not r:
+            continue
+        # reflected canary => the app reads this undocumented parameter
+        if canary in r.text:
+            job.add_vuln("Hidden Parameter", url, param=hp, payload=canary,
+                         evidence=f"Undocumented parameter '{hp}' is reflected — hidden/debug feature reachable")
+            return
+        # large behavioural change for a sensitive switch
+        if hp in ("debug", "admin", "test", "source") and abs(len(r.text) - base_len) > 400:
+            job.add_vuln("Hidden Parameter", url, param=hp, payload=canary,
+                         evidence=f"Parameter '{hp}' changed the response materially (Δ{abs(len(r.text)-base_len)}B) — hidden mode")
+            return
+
+
+# ── Module AX: Forced browsing / access-control bypass ────────────────────────
+def mod_forced_browse(job):
+    protected = ["/admin", "/admin/dashboard", "/administrator", "/manage", "/management",
+                 "/api/admin", "/api/users", "/api/v1/users", "/internal", "/private",
+                 "/config", "/settings/admin", "/dashboard", "/users", "/debug", "/metrics",
+                 "/actuator", "/.git/", "/backup/"]
+    GATE = ["login", "sign in", "unauthorized", "forbidden", "authentication required",
+            "please log in", "access denied"]
+
+    def probe(p):
+        u = job.url.rstrip("/") + p
+        r = job.req(u, allow_redirects=False)
+        if not r:
+            return None
+        if r.status_code == 200:
+            low = r.text.lower()
+            # 200 but NOT a login/redirect gate => content served without auth
+            if not any(g in low for g in GATE) and len(r.text) > 150:
+                hint = "admin/management content" if any(k in p for k in ("admin", "manage", "user")) else "restricted area"
+                return u, f"HTTP 200 with no auth gate — {hint} served without authentication"
+        return None
+
+    seen = 0
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(probe, p) for p in protected]):
+            res = fut.result()
+            if res:
+                u, ev = res
+                job.add_vuln("Forced Browsing", u, evidence=ev)
+                job.chain(f"Forced browsing reaches {u} without auth -> access-control bypass")
+                seen += 1
+                if seen >= 4:
+                    return
+
+
+# ── Module AY: Verbose error / stack-trace disclosure ─────────────────────────
+def mod_verbose_errors(job, url):
+    TRACES = {
+        "Python/Django": ["traceback (most recent call last)", "django.core.exceptions",
+                          "werkzeug.exceptions", "file \"/", "line ", "raise "],
+        "Java/Spring":   ["java.lang.", "org.springframework", "javax.servlet",
+                          "at com.", "nested exception", ".java:"],
+        "PHP":           ["fatal error:", "warning:", "notice:", "stack trace:", "on line",
+                          "call stack", "xdebug"],
+        "Node.js":       ["at object.<anonymous>", "node_modules", "/server.js:", "referenceerror",
+                          "typeerror:", "at module."],
+        "ASP.NET":       ["server error in", "system.web", "stack trace:", "[exception"],
+        "Ruby/Rails":    ["actioncontroller", "activerecord::", ".rb:", "rails.application"],
+    }
+    # Send malformed input designed to trip a server-side error
+    parsed = urlparse(url)
+    params = dict(parse_qsl(parsed.query))
+    test_urls = [url + ("&" if parsed.query else "?") + "phantom[]=1&id='\"\\`%00"]
+    if params:
+        bad = params.copy()
+        for k in list(bad)[:2]:
+            bad[k] = "'\"\\<phantom>%00"
+        test_urls.append(urljoin(url, parsed.path) + "?" + urlencode(bad))
+    test_urls.append(job.url.rstrip("/") + "/phantom_err_%2e%2e%2f%00")
+    for tu in test_urls:
+        r = job.req(tu)
+        if not r:
+            continue
+        low = r.text.lower()
+        for stack, sigs in TRACES.items():
+            hits = [s for s in sigs if s in low]
+            if len(hits) >= 2:
+                job.add_vuln("Verbose Error Disclosure", tu,
+                             evidence=f"{stack} stack trace leaked (markers: {hits[:3]}) — framework/paths exposed")
+                if stack not in job.tech_stack:
+                    job.tech_stack.append(stack)
+                return
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     all_urls = list(job.urls) or [job.url]
-    total    = len(all_urls) * 10 + 12 + 14
+    total    = len(all_urls) * 10 + 12 + 14 + 7
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} URLs with all {36} security modules...", "INFO")
+    job.log(f"Testing {len(all_urls)} URLs with all {48} security modules...", "INFO")
 
     # Per-URL tests (parallelized)
     def scan_url(url):
@@ -2502,6 +2942,11 @@ def phase_vulns(job):
         mod_secrets_scan(job, url)
         mod_nosqli(job, url)
         mod_crlf(job, url)
+        mod_ssti_advanced(job, url)
+        mod_el_injection(job, url)
+        mod_xpath_ldap(job, url)
+        mod_param_mining(job, url)
+        mod_verbose_errors(job, url)
         job.advance("Phase 3: Vulns & Exploits", 10)
 
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
@@ -2548,7 +2993,10 @@ def phase_vulns(job):
               mod_deserialization, mod_http_methods, mod_dir_listing,
               mod_mixed_content, mod_email_security, mod_cloud_storage,
               mod_log4shell, mod_tabnabbing, mod_cache_control,
-              mod_websocket, mod_well_known):
+              mod_websocket, mod_well_known,
+              # round-2 site-wide
+              mod_stored_xss, mod_user_enum, mod_file_upload, mod_backup_files,
+              mod_web_cache_deception, mod_jwt_attacks, mod_forced_browse):
         try:
             m(job)
         except Exception as e:
@@ -2622,7 +3070,8 @@ def verify_findings(job):
     job.log("Verification: scoring findings and filtering false positives...", "INFO")
     STRONG = ["root:x:", "sql error", "you have an error in your sql",
               "ami-id", "instance-id", "redis_version", "230 ", "__schema",
-              "drupal", "wordpress", "JFactory"]
+              "drupal", "wordpress", "JFactory", "1787569", "cracked",
+              "stack trace", "alg:none", "un-encoded", "source code/config"]
     BLIND  = ["time-based", "delayed", "possible", "candidate", "may be",
               "blind", "timeout"]
     confirmed = manual = 0
@@ -2707,6 +3156,46 @@ def analyze_attack_chains(job):
     # Broad attack surface
     if len(job.subdomains) >= 5:
         job.chain(f"ATTACK PATH: {len(job.subdomains)} subdomains widen the surface -> weakest host becomes the entry point")
+
+    # ── Extended correlations (round 2) ───────────────────────────────────────
+    # Template / EL injection -> RCE
+    if has_any("SSTI", "Expression Language Injection"):
+        job.chain("ATTACK PATH: template/EL injection -> expression evaluation -> remote code execution on the server")
+    # Backup/source disclosure -> secrets -> deeper access
+    if has_any("Backup File Exposed", "Source Code Disclosure"):
+        job.chain("ATTACK PATH: backup/source disclosure -> read logic & embedded secrets -> craft precise exploits / DB access")
+    # Forced browsing / admin exposure -> default creds
+    if has_any("Forced Browsing", "Admin Panel Found") and has_any("Default Credentials"):
+        job.chain("ATTACK PATH: exposed admin panel + default credentials -> direct administrative takeover")
+    elif has_any("Forced Browsing"):
+        job.chain("ATTACK PATH: access-control bypass -> reach admin/internal functions without authentication")
+    # JWT forge -> privilege escalation
+    if has_any("Weak JWT Secret"):
+        job.chain("ATTACK PATH: cracked/none JWT secret -> forge a token with role=admin -> full account & data takeover")
+    # File upload -> shell -> RCE
+    if has_any("Unrestricted File Upload"):
+        job.chain("ATTACK PATH: unrestricted upload -> drop a web shell -> remote code execution & persistence")
+    # User enumeration + missing rate limit -> credential stuffing
+    if has_any("User Enumeration") and has_any("Rate Limiting Missing"):
+        job.chain("ATTACK PATH: username enumeration + no rate limiting -> high-speed credential brute-force / stuffing")
+    # Host header / CRLF -> cache poisoning amplification
+    if has_any("Host Header Injection", "CRLF Injection") and has_any("Web Cache Poisoning", "Web Cache Deception"):
+        job.chain("ATTACK PATH: header/CRLF injection -> poison shared cache -> malicious response served to all users")
+    # Stored XSS -> account takeover (worm-able)
+    if has_any("Stored XSS"):
+        job.chain("ATTACK PATH: stored XSS -> hijack sessions of every visitor incl. admins -> self-propagating account takeover")
+    # Subdomain takeover -> cookie/oauth abuse
+    if has_any("Subdomain Takeover"):
+        job.chain("ATTACK PATH: subdomain takeover -> host malicious content on a trusted domain -> steal scoped cookies / bypass OAuth origin checks")
+    # Deserialization / Log4Shell -> RCE
+    if has_any("Insecure Deserialization", "Log4Shell (JNDI)"):
+        job.chain("ATTACK PATH: deserialization/JNDI gadget -> remote code execution -> full server compromise")
+    # NoSQL / XPath / LDAP injection -> auth bypass
+    if has_any("NoSQL Injection", "XPath Injection", "LDAP Injection"):
+        job.chain("ATTACK PATH: NoSQL/XPath/LDAP injection -> authentication bypass and backend data extraction")
+    # Verbose errors feed everything else
+    if has_any("Verbose Error Disclosure") and len(types) > 3:
+        job.chain("ATTACK PATH: verbose errors reveal stack/paths -> attacker fine-tunes the other findings into reliable exploits")
 
     added = len(job.chains) - n_before
     if added == 0:
@@ -2857,7 +3346,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v4.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">WAF+15 WAFs</span><span class="bdg bg">SMART FUZZER</span><span class="bdg byr">36 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v4.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">WAF+15 WAFs</span><span class="bdg bg">SMART FUZZER</span><span class="bdg byr">48 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -2867,7 +3356,7 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v4.0 runs 4 autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + JS Secret Extraction → 36 Vulnerability Modules with Chain Engine. CVSS v3.1 auto-scoring on every finding.</p>
+    <p>PHANTOM v4.0 runs 4 autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + JS Secret Extraction → 48 Vulnerability Modules with Chain Engine. CVSS v3.1 auto-scoring on every finding.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
