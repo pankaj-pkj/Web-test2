@@ -81,6 +81,23 @@ class CVSSv31:
         "Drupal Vulnerability":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="H"),
         "Joomla Vulnerability":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="N"),
         "Default Credentials":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="H"),
+        "NoSQL Injection":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="H"),
+        "Host Header Injection":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="H",a="N"),
+        "CRLF Injection":dict(av="N",ac="L",pr="N",ui="R",s="C",c="L",i="H",a="N"),
+        "Subdomain Takeover":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="N"),
+        "DOM XSS":dict(av="N",ac="L",pr="N",ui="R",s="C",c="L",i="L",a="N"),
+        "Insecure Deserialization":dict(av="N",ac="H",pr="N",ui="N",s="C",c="H",i="H",a="H"),
+        "Dangerous HTTP Method":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="H",a="N"),
+        "Cross-Site Tracing (XST)":dict(av="N",ac="H",pr="N",ui="R",s="U",c="L",i="N",a="N"),
+        "Directory Listing":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "Mixed Content":dict(av="N",ac="H",pr="N",ui="R",s="U",c="L",i="L",a="N"),
+        "Email Spoofing (SPF/DMARC)":dict(av="N",ac="L",pr="N",ui="R",s="U",c="N",i="L",a="N"),
+        "Open Cloud Storage":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="L",a="N"),
+        "Log4Shell (JNDI)":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="H"),
+        "Reverse Tabnabbing":dict(av="N",ac="L",pr="N",ui="R",s="U",c="N",i="L",a="N"),
+        "Cacheable Sensitive Page":dict(av="N",ac="H",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "WebSocket Vulnerability":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="L",a="N"),
+        "Missing security.txt":dict(av="N",ac="L",pr="N",ui="N",s="U",c="N",i="N",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -387,6 +404,50 @@ SUBDOMAIN_WORDS=["admin","api","app","auth","beta","blog","cdn","ci","cloud","cm
     "jenkins","jira","lab","login","mail","manage","mobile","monitor","mysql",
     "old","panel","prod","redis","s3","secure","shop","smtp","ssh","stage",
     "staging","static","store","support","test","tools","upload","vault","vpn","wiki","www2"]
+
+# ══ EXTRA PAYLOADS (new modules) ══════════════════════════════════════════════
+NOSQL_PAYLOADS=["'||'1'=='1","'; return true; var x='","[$ne]=1","[$gt]=",
+    '{"$gt":""}','{"$ne":null}','{"$where":"sleep(3000)"}',"%27%7c%7c%271%27%3d%3d%271"]
+NOSQL_ERRORS=["mongodb","mongoose","unexpected token","bson","$where","casterror",
+              "e11000","cannot read property"]
+CRLF_PAYLOADS=["%0d%0aPhantom-Crlf:injected","%0aPhantom-Crlf:injected",
+    "%0d%0aSet-Cookie:phantomcrlf=1","%E5%98%8A%E5%98%8DPhantom-Crlf:injected"]
+# Fingerprints for dangling 3rd-party services (subdomain takeover)
+TAKEOVER_FINGERPRINTS={
+    "GitHub Pages":"there isn't a github pages site here",
+    "Heroku":"no such app",
+    "AWS S3":"the specified bucket does not exist",
+    "Shopify":"sorry, this shop is currently unavailable",
+    "Fastly":"fastly error: unknown domain",
+    "Pantheon":"the gods are wise, but do not know of the site",
+    "Tumblr":"whatever you were looking for doesn't currently exist",
+    "Surge.sh":"project not found",
+    "Bitbucket":"repository not found",
+    "Unbounce":"the requested url was not found on this server",
+    "Ghost":"the thing you were looking for is no longer here",
+    "Cargo":"<title>404 &mdash; file not found</title>",
+    "Webflow":"the page you are looking for doesn't exist or has been moved",
+    "Netlify":"not found - request id",
+}
+# JavaScript sinks/sources that indicate DOM-based XSS
+DOM_XSS_SINKS=["innerhtml","outerhtml","document.write","document.writeln",
+    "insertadjacenthtml",".html(","eval(","settimeout(","setinterval(",
+    "new function(","location.href","location.replace","location.assign",
+    "window.open","$(","jquery"]
+DOM_XSS_SOURCES=["location.search","location.hash","location.href","document.url",
+    "document.referrer","document.cookie","window.name","localstorage","sessionstorage",
+    "postmessage"]
+# Deserialization magic markers in responses/cookies
+DESER_MARKERS={
+    "PHP Object":r"O:\d+:\"[A-Za-z0-9_\\]+\":\d+:\{",
+    "Java Serialized (b64)":r"rO0AB[A-Za-z0-9+/=]+",
+    "Java Serialized (hex)":r"aced0005",
+    "Python Pickle":r"\\x80\\x04|\\x80\\x03|c__builtin__",
+    ".NET ViewState":r"__VIEWSTATE",
+    "Ruby Marshal":r"\\x04\\x08",
+}
+HTTP_METHODS_TEST=["OPTIONS","PUT","DELETE","TRACE","TRACK","CONNECT","PATCH","PROPFIND"]
+LOG4SHELL_HEADERS=["User-Agent","Referer","X-Api-Version","X-Forwarded-For"]
 VULN_IMPACT={
     "SQL Injection":"Full DB compromise — read/modify/delete, RCE via INTO OUTFILE",
     "SQL Injection (Form)":"Full DB compromise via form input",
@@ -436,6 +497,23 @@ VULN_IMPACT={
     "IDOR":"Access other users data — privilege escalation",
     "Stack Trace Leaked":"Framework/path info — aids targeted attacks",
     "Proto Pollution":"JavaScript prototype pollution — DoS or RCE in Node.js",
+    "NoSQL Injection":"Auth bypass and data extraction via MongoDB operator injection",
+    "Host Header Injection":"Password-reset poisoning, cache poisoning, web-cache deception",
+    "CRLF Injection":"HTTP response splitting — header injection, XSS, cache poisoning",
+    "Subdomain Takeover":"Attacker claims dangling subdomain — full content control, cookie theft",
+    "DOM XSS":"Client-side XSS via unsafe JavaScript sink — session/credential theft",
+    "Insecure Deserialization":"Remote Code Execution via crafted serialized object",
+    "Dangerous HTTP Method":"PUT/DELETE enabled — file upload, defacement, resource deletion",
+    "Cross-Site Tracing (XST)":"TRACE method reflects headers — bypass HttpOnly, steal cookies",
+    "Directory Listing":"Auto-index exposes file tree — source, backups, configs browsable",
+    "Mixed Content":"HTTP assets on HTTPS page — MITM injection, downgrade",
+    "Email Spoofing (SPF/DMARC)":"Missing SPF/DMARC — domain phishing and email forgery possible",
+    "Open Cloud Storage":"Public S3/GCS/Azure bucket — data leak or content tampering",
+    "Log4Shell (JNDI)":"CVE-2021-44228 — RCE via JNDI lookup in log4j",
+    "Reverse Tabnabbing":"target=_blank without noopener — phishing via window.opener",
+    "Cacheable Sensitive Page":"Private page cached by proxy/CDN — data leaks to other users",
+    "WebSocket Vulnerability":"Cross-site WebSocket hijacking or unauthenticated WS access",
+    "Missing security.txt":"No RFC 9116 security.txt — slows responsible disclosure",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -464,6 +542,23 @@ VULN_FIX={
     "Command Injection":["Never pass input to shell_exec/system/exec","Use subprocess with array args (shell=False)"],
     "WordPress Vulnerability":["Keep WordPress core and plugins updated","Disable xmlrpc.php if unused","Use security plugin like Wordfence"],
     "Default Credentials":["Change all default passwords immediately","Implement account lockout after failed attempts","Use password manager for all service credentials"],
+    "NoSQL Injection":["Cast user input to expected type before querying","Use parameterized queries / ODM schema validation","Reject query operators ($gt,$ne,$where) in user input"],
+    "Host Header Injection":["Use a server-side allow-list of valid Host values","Never build URLs (reset links) from the Host header","Set an explicit ServerName / canonical host"],
+    "CRLF Injection":["Strip \\r and \\n from all user input used in headers","Use framework header APIs that reject newlines","URL-encode redirect and cookie values"],
+    "Subdomain Takeover":["Remove dangling DNS records pointing to deprovisioned services","Claim the resource before deleting the cloud service","Monitor CNAMEs for unresolved targets"],
+    "DOM XSS":["Avoid innerHTML/document.write with untrusted data","Use textContent or trusted-types","Sanitize with DOMPurify before insertion"],
+    "Insecure Deserialization":["Never deserialize untrusted data","Use signed/encrypted tokens or plain JSON","Apply integrity checks (HMAC) on serialized blobs"],
+    "Dangerous HTTP Method":["Disable WebDAV / PUT / DELETE unless required","Restrict methods at the web-server or WAF level","Return 405 for unsupported verbs"],
+    "Cross-Site Tracing (XST)":["Disable the TRACE method (TraceEnable Off)","Block TRACE/TRACK at the proxy/WAF"],
+    "Directory Listing":["Disable auto-index (Options -Indexes / autoindex off)","Add an index file to each directory","Restrict directory access"],
+    "Mixed Content":["Serve all assets over HTTPS","Add Content-Security-Policy: upgrade-insecure-requests","Audit hard-coded http:// asset URLs"],
+    "Email Spoofing (SPF/DMARC)":["Publish a strict SPF record (-all)","Add a DMARC policy (p=reject/quarantine)","Enable DKIM signing"],
+    "Open Cloud Storage":["Block public ACLs and bucket policies","Enable S3 Block Public Access","Require authentication / signed URLs"],
+    "Log4Shell (JNDI)":["Upgrade log4j to 2.17.1+","Set log4j2.formatMsgNoLookups=true","Remove the JndiLookup class from the classpath"],
+    "Reverse Tabnabbing":["Add rel=\"noopener noreferrer\" to target=_blank links","Set window.opener=null when opening new tabs"],
+    "Cacheable Sensitive Page":["Set Cache-Control: no-store, private on authenticated pages","Add Pragma: no-cache","Never cache personalised responses at the CDN"],
+    "WebSocket Vulnerability":["Validate the Origin header on the WS handshake","Authenticate every WebSocket connection","Use wss:// (TLS) only"],
+    "Missing security.txt":["Publish /.well-known/security.txt per RFC 9116","Include a security contact and disclosure policy"],
 }
 
 
@@ -570,12 +665,16 @@ class ScanJob:
             "Accept-Language":"en-US,en;q=0.5",
             "Connection":    "keep-alive",
         }
+        # Merge caller-supplied headers instead of colliding with the defaults
+        h.update(kw.pop("headers", None) or {})
+        # Let callers override redirect behaviour without a kwarg collision
+        allow_redirects = kw.pop("allow_redirects", True)
         self._ua += 1
         for attempt in range(2):
             try:
                 t0 = time.time()
                 r  = requests.request(method, url, headers=h, timeout=TIMEOUT,
-                                      verify=False, allow_redirects=True, **kw)
+                                      verify=False, allow_redirects=allow_redirects, **kw)
                 lat = time.time() - t0
                 self._lat.append(lat)
                 if len(self._lat) > 10: self._lat.pop(0)
@@ -2032,12 +2131,361 @@ def mod_fingerprint(job):
         pass
 
 
+# ══ NEW VULNERABILITY MODULES (extended coverage) ════════════════════════════
+
+# ── Module X: NoSQL Injection ─────────────────────────────────────────────────
+def mod_nosqli(job, url):
+    """MongoDB-style operator injection in query params (auth bypass / extraction)."""
+    params = dict(parse_qsl(urlparse(url).query))
+    if not params:
+        return
+    base = job.req(url)
+    if not base:
+        return
+    for param in params:
+        for payload in NOSQL_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp)
+            if not r:
+                continue
+            low = r.text.lower()
+            if any(e in low for e in NOSQL_ERRORS):
+                job.add_vuln("NoSQL Injection", url, param=param, payload=payload,
+                             evidence="NoSQL/MongoDB error signature reflected — operator injection likely")
+                return
+            # Boolean-based: $ne/$gt returning a much larger authenticated-like page
+            if r.status_code == 200 and len(r.text) - len(base.text) > 250 and "$" in payload:
+                job.add_vuln("NoSQL Injection", url, param=param, payload=payload,
+                             evidence="Operator payload returned materially more data — possible auth/filter bypass")
+                return
+
+
+# ── Module Y: Host Header Injection ───────────────────────────────────────────
+def mod_host_header(job):
+    """Tests password-reset poisoning / routing-based Host header trust."""
+    evil = "evil-phantom-test.com"
+    for hdrs in ({"Host": evil},
+                 {"X-Forwarded-Host": evil},
+                 {"Host": job.host, "X-Forwarded-Host": evil}):
+        r = job.req(job.url, headers=hdrs, allow_redirects=False)
+        if not r:
+            continue
+        loc = r.headers.get("Location", "")
+        if evil in loc:
+            job.add_vuln("Host Header Injection", job.url, payload=str(hdrs),
+                         evidence=f"Injected host reflected in Location: {loc[:70]}")
+            return
+        if evil in r.text:
+            job.add_vuln("Host Header Injection", job.url, payload=str(hdrs),
+                         evidence="Injected Host value reflected in response body (reset-link poisoning risk)")
+            return
+
+
+# ── Module Z: CRLF Injection / HTTP Response Splitting ────────────────────────
+def mod_crlf(job, url):
+    params = dict(parse_qsl(urlparse(url).query)) or {"q": "1", "redirect": "1"}
+    targets = list(params.keys())[:4]
+    for param in targets:
+        for payload in CRLF_PAYLOADS:
+            tp = params.copy(); tp[param] = payload
+            r = job.req(url, params=tp, allow_redirects=False)
+            if not r:
+                continue
+            hdr_blob = "\n".join(f"{k}: {v}" for k, v in r.headers.items()).lower()
+            if "phantom-crlf" in hdr_blob or "phantomcrlf" in hdr_blob:
+                job.add_vuln("CRLF Injection", url, param=param, payload=payload,
+                             evidence="Injected CRLF created a new response header — HTTP response splitting")
+                return
+
+
+# ── Module AA: Subdomain Takeover ─────────────────────────────────────────────
+def mod_subdomain_takeover(job):
+    """Checks discovered subdomains for dangling-CNAME takeover fingerprints."""
+    candidates = list(job.subdomains)[:25]
+    if not candidates:
+        return
+
+    def check(sub):
+        for scheme in ("https://", "http://"):
+            try:
+                r = requests.get(scheme + sub, timeout=TIMEOUT, verify=False,
+                                 headers={"User-Agent": UAS[0]}, allow_redirects=True)
+            except Exception:
+                continue
+            body = r.text.lower()
+            for service, sig in TAKEOVER_FINGERPRINTS.items():
+                if sig in body:
+                    return sub, service
+            return None
+        return None
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(check, s) for s in candidates]):
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
+            if res:
+                sub, service = res
+                job.add_vuln("Subdomain Takeover", sub, payload=service,
+                             evidence=f"{sub} serves '{service}' not-found page — dangling record, takeover possible")
+                job.chain(f"Subdomain takeover on {sub} via unclaimed {service} resource")
+
+
+# ── Module AB: DOM-based XSS (static JS analysis) ─────────────────────────────
+def mod_dom_xss(job):
+    """Flags client-side XSS where a tainted source flows toward a dangerous sink."""
+    seen = 0
+    for js_url in list(job.js_files)[:25]:
+        r = job.req(js_url)
+        if not r:
+            continue
+        low = r.text.lower()
+        sinks   = [s for s in DOM_XSS_SINKS if s in low]
+        sources = [s for s in DOM_XSS_SOURCES if s in low]
+        if sinks and sources:
+            job.add_vuln("DOM XSS", js_url,
+                         evidence=f"Tainted source ({sources[:3]}) reaches sink ({sinks[:3]}) in client JS",
+                         extracted={"sources": sources[:5], "sinks": sinks[:5]})
+            seen += 1
+            if seen >= 5:
+                return
+    # also inspect inline scripts of the main page
+    r = job.req(job.url)
+    if r:
+        for sc in re.findall(r"<script[^>]*>(.*?)</script>", r.text, re.S | re.I):
+            low = sc.lower()
+            sinks   = [s for s in DOM_XSS_SINKS if s in low]
+            sources = [s for s in DOM_XSS_SOURCES if s in low]
+            if sinks and sources:
+                job.add_vuln("DOM XSS", job.url,
+                             evidence=f"Inline script: source {sources[:2]} flows to sink {sinks[:2]}")
+                return
+
+
+# ── Module AC: Insecure Deserialization indicators ────────────────────────────
+def mod_deserialization(job):
+    r = job.req(job.url)
+    if not r:
+        return
+    blob = r.text + str(dict(r.headers)) + str(r.cookies.get_dict())
+    for name, pattern in DESER_MARKERS.items():
+        m = re.search(pattern, blob)
+        if m:
+            job.add_vuln("Insecure Deserialization", job.url,
+                         payload=name, evidence=f"{name} marker present in response/cookie — untrusted deserialization risk")
+            if name == ".NET ViewState" and "__VIEWSTATEGENERATOR" in blob and "viewstateuserkey" not in blob.lower():
+                job.chain("ASP.NET __VIEWSTATE present without MAC/UserKey hardening — deserialization gadget risk")
+            return
+
+
+# ── Module AD: Dangerous HTTP Methods + XST ───────────────────────────────────
+def mod_http_methods(job):
+    allowed = []
+    r = job.req(job.url, method="OPTIONS")
+    if r and r.headers.get("Allow"):
+        allowed = [m.strip().upper() for m in r.headers["Allow"].split(",")]
+        risky = [m for m in allowed if m in ("PUT", "DELETE", "PATCH", "PROPFIND", "CONNECT")]
+        if risky:
+            job.add_vuln("Dangerous HTTP Method", job.url,
+                         payload=",".join(risky),
+                         evidence=f"OPTIONS advertises state-changing methods: {', '.join(risky)}")
+    # Active probe for TRACE (XST) and PUT
+    rt = job.req(job.url, method="TRACE")
+    if rt and rt.status_code == 200 and ("TRACE" in rt.text or job.host in rt.text):
+        job.add_vuln("Cross-Site Tracing (XST)", job.url, payload="TRACE",
+                     evidence="TRACE enabled and echoes the request — Cross-Site Tracing possible")
+    rp = job.req(job.url.rstrip("/") + "/phantom_put_test.txt", method="PUT",
+                 data="phantom-put-test")
+    if rp and rp.status_code in (200, 201, 204):
+        job.add_vuln("Dangerous HTTP Method", job.url, payload="PUT",
+                     evidence=f"PUT returned {rp.status_code} — arbitrary file upload / WebDAV likely enabled")
+
+
+# ── Module AE: Directory Listing ──────────────────────────────────────────────
+def mod_dir_listing(job):
+    dirs = set()
+    for u in list(job.urls)[:60]:
+        path = urlparse(u).path
+        if "/" in path.rstrip("/"):
+            dirs.add(job.url.rstrip("/") + path.rsplit("/", 1)[0] + "/")
+    dirs.update(job.url.rstrip("/") + d + "/" for d in
+                ["/uploads", "/images", "/img", "/files", "/backup", "/assets",
+                 "/static", "/data", "/tmp", "/css", "/js", "/docs", "/download"])
+    SIGS = ["index of /", "<title>index of", "directory listing for",
+            "[to parent directory]", "parent directory</a>"]
+
+    def probe(d):
+        r = job.req(d)
+        if r and r.status_code == 200 and any(s in r.text.lower() for s in SIGS):
+            return d
+        return None
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(probe, d) for d in list(dirs)[:30]]):
+            d = fut.result()
+            if d:
+                job.add_vuln("Directory Listing", d,
+                             evidence="Auto-index enabled — directory contents are browsable")
+
+
+# ── Module AF: Mixed Content (HTTP assets on HTTPS) ───────────────────────────
+def mod_mixed_content(job):
+    if not job.url.lower().startswith("https://"):
+        return
+    r = job.req(job.url)
+    if not r:
+        return
+    insecure = set(re.findall(r'(?:src|href)\s*=\s*["\'](http://[^"\']+)["\']',
+                              r.text, re.I))
+    insecure = {u for u in insecure if not u.startswith("http://localhost")}
+    if insecure:
+        job.add_vuln("Mixed Content", job.url,
+                     evidence=f"{len(insecure)} HTTP asset(s) loaded over HTTPS page — MITM injection risk",
+                     extracted={"sample": list(insecure)[:5]})
+
+
+# ── Module AG: Email Security (SPF / DMARC / DKIM via DNS) ─────────────────────
+def mod_email_security(job):
+    if not DNS_OK:
+        return
+    domain = ".".join(job.host.split(".")[-2:]) if job.host.count(".") >= 1 else job.host
+    spf = dmarc = False
+    try:
+        for rec in dns.resolver.resolve(domain, "TXT"):
+            if "v=spf1" in str(rec).lower():
+                spf = True
+    except Exception:
+        pass
+    try:
+        for rec in dns.resolver.resolve("_dmarc." + domain, "TXT"):
+            if "v=dmarc1" in str(rec).lower():
+                dmarc = True
+    except Exception:
+        pass
+    missing = []
+    if not spf:   missing.append("SPF")
+    if not dmarc: missing.append("DMARC")
+    if missing:
+        job.add_vuln("Email Spoofing (SPF/DMARC)", domain,
+                     payload=",".join(missing),
+                     evidence=f"Missing {', '.join(missing)} record(s) — domain can be spoofed in phishing email")
+
+
+# ── Module AH: Open Cloud Storage buckets ─────────────────────────────────────
+def mod_cloud_storage(job):
+    base = job.host.split(".")[0]
+    names = {base, base + "-assets", base + "-static", base + "-backup",
+             base + "-uploads", base + "-media", base + "-prod", base + "-dev"}
+    tested = []
+    for n in list(names)[:8]:
+        tested.append(("AWS S3", f"https://{n}.s3.amazonaws.com/"))
+        tested.append(("GCS", f"https://storage.googleapis.com/{n}/"))
+        tested.append(("Azure Blob", f"https://{n}.blob.core.windows.net/?comp=list"))
+
+    def probe(item):
+        provider, u = item
+        try:
+            r = requests.get(u, timeout=TIMEOUT, verify=False,
+                             headers={"User-Agent": UAS[0]})
+        except Exception:
+            return None
+        low = r.text.lower()
+        if r.status_code == 200 and ("<listbucketresult" in low or "<enumerationresults" in low
+                                     or "<contents>" in low):
+            return provider, u
+        return None
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(probe, it) for it in tested]):
+            res = fut.result()
+            if res:
+                provider, u = res
+                job.add_vuln("Open Cloud Storage", u, payload=provider,
+                             evidence=f"Public {provider} bucket lists contents without auth")
+                job.chain(f"Publicly listable {provider} bucket discovered: {u}")
+
+
+# ── Module AI: Log4Shell / JNDI injection probe ───────────────────────────────
+def mod_log4shell(job):
+    """Out-of-band-safe heuristic probe (collaborator-free): looks for error/echo."""
+    marker = "phantom-jndi-test"
+    payload = "${jndi:ldap://" + marker + ".invalid/a}"
+    for hdr in LOG4SHELL_HEADERS:
+        r = job.req(job.url, headers={hdr: payload})
+        if not r:
+            continue
+        # If the lookup string is parsed/echoed back changed, or triggers a 500 stack trace
+        if "jndi" in r.text.lower() and "ldap" in r.text.lower() and r.status_code >= 500:
+            job.add_vuln("Log4Shell (JNDI)", job.url, param=hdr, payload=payload,
+                         evidence="JNDI payload triggered a server error referencing the lookup — log4j RCE suspected")
+            job.chain("Log4Shell (CVE-2021-44228) — JNDI lookup appears to be evaluated server-side")
+            return
+
+
+# ── Module AJ: Reverse Tabnabbing ─────────────────────────────────────────────
+def mod_tabnabbing(job):
+    r = job.req(job.url)
+    if not r:
+        return
+    bad = 0
+    for m in re.finditer(r"<a\b[^>]*target\s*=\s*[\"']?_blank[\"']?[^>]*>", r.text, re.I):
+        tag = m.group(0).lower()
+        if "noopener" not in tag and "noreferrer" not in tag:
+            bad += 1
+    if bad:
+        job.add_vuln("Reverse Tabnabbing", job.url,
+                     evidence=f"{bad} link(s) use target=_blank without rel=noopener — window.opener phishing")
+
+
+# ── Module AK: Cacheable sensitive pages ──────────────────────────────────────
+def mod_cache_control(job):
+    sensitive = ["/account", "/profile", "/dashboard", "/settings", "/my-account",
+                 "/user", "/orders", "/billing"]
+    for p in sensitive:
+        r = job.req(job.url.rstrip("/") + p, allow_redirects=False)
+        if not r or r.status_code != 200:
+            continue
+        cc = r.headers.get("Cache-Control", "").lower()
+        if not cc or ("no-store" not in cc and "private" not in cc and "no-cache" not in cc):
+            job.add_vuln("Cacheable Sensitive Page", job.url.rstrip("/") + p,
+                         evidence=f"Authenticated-style page lacks Cache-Control no-store/private (got: '{cc or 'none'}')")
+            return
+
+
+# ── Module AL: WebSocket exposure ─────────────────────────────────────────────
+def mod_websocket(job):
+    found = set()
+    for u in [job.url] + list(job.js_files)[:20]:
+        r = job.req(u)
+        if not r:
+            continue
+        for m in re.finditer(r"wss?://[A-Za-z0-9_.:/\-]+", r.text):
+            found.add(m.group(0))
+    for ws in list(found)[:5]:
+        scheme_ok = ws.startswith("wss://")
+        job.add_vuln("WebSocket Vulnerability", ws,
+                     evidence=("WebSocket endpoint found"
+                               + ("" if scheme_ok else " over plaintext ws:// (no TLS)")
+                               + " — verify Origin check & auth on handshake"))
+
+
+# ── Module AM: security.txt / responsible disclosure ──────────────────────────
+def mod_well_known(job):
+    for p in ["/.well-known/security.txt", "/security.txt"]:
+        r = job.req(job.url.rstrip("/") + p)
+        if r and r.status_code == 200 and "contact" in r.text.lower():
+            return
+    job.add_vuln("Missing security.txt", job.url,
+                 evidence="No RFC 9116 security.txt found — no machine-readable disclosure contact")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     all_urls = list(job.urls) or [job.url]
-    total    = len(all_urls) * 10 + 12
+    total    = len(all_urls) * 10 + 12 + 14
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} URLs with all {20} security modules...", "INFO")
+    job.log(f"Testing {len(all_urls)} URLs with all {36} security modules...", "INFO")
 
     # Per-URL tests (parallelized)
     def scan_url(url):
@@ -2052,6 +2500,8 @@ def phase_vulns(job):
         mod_business_logic(job, url)
         mod_cache_poison(job, url)
         mod_secrets_scan(job, url)
+        mod_nosqli(job, url)
+        mod_crlf(job, url)
         job.advance("Phase 3: Vulns & Exploits", 10)
 
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
@@ -2092,6 +2542,18 @@ def phase_vulns(job):
     job.advance("Phase 3: Vulns & Exploits")
     mod_fingerprint(job)
     job.advance("Phase 3: Vulns & Exploits")
+
+    # ── Extended site-wide modules ────────────────────────────────────────────
+    for m in (mod_host_header, mod_subdomain_takeover, mod_dom_xss,
+              mod_deserialization, mod_http_methods, mod_dir_listing,
+              mod_mixed_content, mod_email_security, mod_cloud_storage,
+              mod_log4shell, mod_tabnabbing, mod_cache_control,
+              mod_websocket, mod_well_known):
+        try:
+            m(job)
+        except Exception as e:
+            job.log(f"{m.__name__} error: {str(e)[:60]}", "WARN")
+        job.advance("Phase 3: Vulns & Exploits")
 
 
 # ══ MAIN SCAN RUNNER ══════════════════════════════════════════════════════════
@@ -2395,7 +2857,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v4.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">WAF+15 WAFs</span><span class="bdg bg">SMART FUZZER</span><span class="bdg byr">20 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v4.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">WAF+15 WAFs</span><span class="bdg bg">SMART FUZZER</span><span class="bdg byr">36 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -2405,7 +2867,7 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v4.0 runs 4 autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + JS Secret Extraction → 20 Vulnerability Modules with Chain Engine. CVSS v3.1 auto-scoring on every finding.</p>
+    <p>PHANTOM v4.0 runs 4 autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + JS Secret Extraction → 36 Vulnerability Modules with Chain Engine. CVSS v3.1 auto-scoring on every finding.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
