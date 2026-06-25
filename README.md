@@ -1,20 +1,39 @@
-# PHANTOM v4.0 — Web Vulnerability Scanner
+# PHANTOM v5.0 — Web Vulnerability Scanner
 
 ● Live Scanning Web Interface (Render Deployment): https://web-testing-ybe5.onrender.com/
 
 An autonomous, single-file web application security scanner with a live Flask UI.
-It runs four phases — **OSINT/Recon → Port Scan → Spider + JS Secret Extraction →
-48 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
+It runs autonomous phases — **OSINT/Recon → Port Scan → Spider + Headless DOM →
+54 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
 **false-positive verification** pass, and correlates issues into **multi-step attack
-chains**. No external API keys required.
+chains**. **No paid API or LLM required — pure Python.**
 
 ## Highlights
-- **48 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
-- **CVSS v3.1** auto-scoring with full vector strings
-- **WAF fingerprinting** (15+ WAFs) and payload mutation
-- **Smart Fuzzer** + recon-driven **hypothesis engine**
-- **Verification layer** that flags blind/weak findings for manual review
-- **Attack-chain analyzer** that narrates how findings compound into real risk
+- **54 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
+- **Out-of-Band (OOB) engine** — the scanner's own public URL is the interaction
+  listener, so blind SSRF / RCE / XXE are *confirmed* via real call-backs (no
+  third-party collaborator service needed)
+- **Reinforcement-learning payload mutation** — an epsilon-greedy multi-armed
+  bandit learns which mutation slips past *this* target's WAF/filters, then reuses it
+- **Stateful business-logic testing** — drives multi-step flows with a live session
+  to find sequence bypass, coupon replay and quantity tampering
+- **API & mobile-backend fuzzing** — mass assignment, excessive data exposure,
+  method-override smuggling, broken object/function-level access
+- **Headless browser (Playwright)** — renders SPAs in real Chromium for dynamic
+  DOM-XSS confirmation and client-side route discovery (degrades gracefully)
+- **Speed-first**: URL-shape de-duplication, 24 worker threads, time budget — a
+  typical scan finishes in well under a minute
+- **CVSS v3.1** auto-scoring, **WAF fingerprinting** (15+ WAFs), recon-driven
+  **hypothesis engine**, a **verification layer** for false-positive reduction,
+  and an **attack-chain analyzer** that shows how findings compound
+
+### Configuration (environment variables)
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OOB_URL` / `RENDER_EXTERNAL_URL` | (Render sets it) | Public base for the OOB listener |
+| `PHANTOM_FAST` | `1` | Speed-first mode |
+| `PHANTOM_BUDGET` | `300` | Hard per-scan time budget (seconds) |
+| `PHANTOM_THREADS` | `24` | Concurrent workers |
 
 ## Detection coverage (48 modules)
 

