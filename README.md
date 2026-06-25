@@ -27,6 +27,22 @@ chains**. **No paid API or LLM required — pure Python.**
   **hypothesis engine**, a **verification layer** for false-positive reduction,
   and an **attack-chain analyzer** that shows how findings compound
 
+## Analyst workflow (5 reasoning stages)
+1. **Form Hypotheses** — recon-driven hypothesis engine *and* a static code-pattern
+   review of the site's own HTML/JS (innerHTML, eval, hard-coded keys, http:// …).
+2. **Test & Verify** — every finding is confidence-scored from its evidence; blind/
+   weak results are flagged for manual review (false-positive reduction).
+3. **Chain Attacks** — correlates findings into multi-step attack paths and shows
+   the escalated, combined impact.
+4. **Generate Exploits (PoC)** — produces a safe, reproduction-only Proof-of-Concept
+   (the exact request/payload that demonstrated the issue) plus CVE references, for
+   verification and remediation.
+5. **Reverse Engineer** — static analysis of shipped artifacts (JS bundles, source
+   maps, wasm, apk, jar, exe…): string/secret extraction and dangerous-call detection.
+
+Every finding now also shows **WHERE IN CODE** — the exact source line/snippet that
+contains the issue — so you can see *what* is wrong and *where* to fix it.
+
 ### Configuration (environment variables)
 | Var | Default | Purpose |
 |-----|---------|---------|

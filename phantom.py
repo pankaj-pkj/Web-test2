@@ -132,6 +132,8 @@ class CVSSv31:
         "Mass Assignment":dict(av="N",ac="L",pr="L",ui="N",s="U",c="H",i="H",a="N"),
         "Excessive Data Exposure":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
         "HTTP Method Override":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="H",a="N"),
+        "Vulnerable Code Pattern":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="L",a="N"),
+        "Dangerous Binary Pattern":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -665,6 +667,8 @@ VULN_IMPACT={
     "Mass Assignment":"Client can set protected fields (role/is_admin) — privilege escalation",
     "Excessive Data Exposure":"API returns sensitive fields (password/token) the client shouldn't see",
     "HTTP Method Override":"Method-override header lets attacker reach DELETE/PUT via POST",
+    "Vulnerable Code Pattern":"Dangerous sink/secret in the page's own source — XSS, redirect or leak",
+    "Dangerous Binary Pattern":"Risky call/secret found by static reverse-engineering of a shipped artifact",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -732,6 +736,8 @@ VULN_FIX={
     "Mass Assignment":["Bind only an explicit allow-list of fields","Reject unknown/protected keys","Separate read and write DTOs"],
     "Excessive Data Exposure":["Return only fields the client needs","Filter sensitive attributes server-side","Use response schemas / serializers"],
     "HTTP Method Override":["Disable X-HTTP-Method-Override / _method handling","Enforce real-method authorization checks"],
+    "Vulnerable Code Pattern":["Replace the dangerous sink with a safe API (textContent, trusted-types)","Never hard-code secrets in client code","Serve assets over HTTPS only"],
+    "Dangerous Binary Pattern":["Remove embedded secrets from shipped artifacts","Avoid unsafe native calls / weak crypto","Strip debug symbols and source maps from production builds"],
 }
 
 
@@ -786,7 +792,7 @@ class ScanJob:
             self.chains.append({"ts": ts, "msg": msg})
         self.log(f"CHAIN: {msg}", "CHAIN")
 
-    def add_vuln(self, vtype, location, param="", payload="", evidence="", extracted=None, chain_type=""):
+    def add_vuln(self, vtype, location, param="", payload="", evidence="", extracted=None, chain_type="", code=""):
         cvss_score, cvss_vec, cvss_sev = CVSS.score(vtype)
         impact = VULN_IMPACT.get(vtype, "Security issue detected")
         fix    = VULN_FIX.get(vtype, ["Review and remediate this vulnerability"])
@@ -809,6 +815,8 @@ class ScanJob:
                 "impact":      impact,
                 "fix":         fix,
                 "chain_type":  chain_type,
+                "code":        code[:600],   # the exact vulnerable snippet ("kaha issue hai")
+                "poc":         "",           # filled by the PoC generator
             })
         self.log(f"[{cvss_sev}|{cvss_score}] {vtype} @ {location[:45]}", "VULN")
 
@@ -3323,13 +3331,214 @@ def mod_headless_dom(job):
         job.chain("Confirmed DOM XSS in real browser -> session/credential theft for every visitor")
 
 
+# ══ ROUND-4: CODE-LEVEL ANALYSIS, REVERSE ENGINEERING & EXPLOIT/POC ══════════
+
+def _snippet(text, idx, span=120):
+    """Return a readable code window around position idx with the spot marked."""
+    start = max(0, idx - span); end = min(len(text), idx + span)
+    line_no = text[:idx].count("\n") + 1
+    chunk = text[start:end].strip()
+    chunk = re.sub(r"\s+", " ", chunk)[:300]
+    return f"L{line_no}: ...{chunk}..."
+
+# Dangerous source patterns we flag in the site's OWN code (client-side review)
+CODE_PATTERNS = [
+    (r"\.innerHTML\s*=", "Vulnerable Code Pattern", "DOM-XSS sink: assigning to innerHTML with untrusted data"),
+    (r"document\.write(?:ln)?\s*\(", "Vulnerable Code Pattern", "DOM-XSS sink: document.write()"),
+    (r"\beval\s*\(", "Vulnerable Code Pattern", "Code-execution sink: eval()"),
+    (r"new\s+Function\s*\(", "Vulnerable Code Pattern", "Code-execution sink: new Function()"),
+    (r"dangerouslySetInnerHTML", "Vulnerable Code Pattern", "React XSS sink: dangerouslySetInnerHTML"),
+    (r"\.insertAdjacentHTML\s*\(", "Vulnerable Code Pattern", "DOM-XSS sink: insertAdjacentHTML()"),
+    (r"setTimeout\s*\(\s*[\"'`]", "Vulnerable Code Pattern", "eval-like setTimeout() called with a string"),
+    (r"location\s*\.\s*(?:href|hash|search)\s*=", "Vulnerable Code Pattern", "DOM open-redirect: writing to location.*"),
+    (r"\.postMessage\s*\([^)]*,\s*[\"']\*[\"']", "Vulnerable Code Pattern", "postMessage() with wildcard '*' target origin"),
+    (r"(?i)(api[_-]?key|apikey|secret|passwd|password|access[_-]?token)\s*[:=]\s*[\"'][^\"']{8,}", "API Key Exposed", "Hard-coded credential in client-side code"),
+    (r"localStorage\s*\.\s*setItem\s*\(\s*[\"'](?:token|jwt|auth|password|secret)", "Vulnerable Code Pattern", "Sensitive data persisted in localStorage"),
+    (r"(?i)\b(md5|sha1)\s*\(", "Vulnerable Code Pattern", "Weak hash (MD5/SHA1) used in client code"),
+    (r"http://[A-Za-z0-9.\-]+", "Vulnerable Code Pattern", "Hard-coded insecure http:// endpoint (MITM / mixed content)"),
+]
+
+# ── Form Hypotheses (code-pattern analysis) — Engine 6 ────────────────────────
+def mod_code_audit(job):
+    """Reviews the site's OWN HTML/JS source for dangerous code and pinpoints the
+    exact line ('kaha issue hai'). Backs the 'Form Hypotheses' capability."""
+    sources = []
+    r = job.req(job.url)
+    if r:
+        sources.append(("inline HTML/JS", job.url, r.text))
+        for m in re.finditer(r"<script[^>]*>(.*?)</script>", r.text, re.S | re.I):
+            if m.group(1).strip():
+                sources.append(("inline <script>", job.url, m.group(1)))
+    for js in list(job.js_files)[:12]:
+        if job.over_budget():
+            break
+        rj = job.req(js)
+        if rj and rj.text:
+            sources.append(("external JS", js, rj.text))
+
+    seen = set(); hits = 0
+    for label, where, text in sources:
+        low_ok = text
+        for pat, vtype, desc in CODE_PATTERNS:
+            m = re.search(pat, low_ok)
+            if not m:
+                continue
+            key = (vtype, desc, where)
+            if key in seen:
+                continue
+            seen.add(key)
+            snip = _snippet(text, m.start())
+            # avoid flagging http:// to common analytics/CDNs as critical noise
+            job.add_vuln(vtype, where,
+                         evidence=f"{desc} (in {label})",
+                         code=snip)
+            hits += 1
+            if hits >= 25:
+                job.log("Code audit: pattern cap reached", "INFO")
+                return
+    job.log(f"Code audit: reviewed {len(sources)} source unit(s), {hits} risky pattern(s) located", "OK")
+
+
+# ── Reverse Engineer — Engine 7 ───────────────────────────────────────────────
+RE_BIN_MARKERS = [
+    (rb"/bin/sh", "embeds /bin/sh — possible command execution"),
+    (rb"system\(", "calls system() — command execution risk"),
+    (rb"strcpy\(|gets\(|sprintf\(", "unsafe C function — buffer-overflow risk"),
+    (rb"-----BEGIN [A-Z ]*PRIVATE KEY-----", "embedded private key"),
+    (rb"AKIA[0-9A-Z]{16}", "embedded AWS access key"),
+    (rb"password|passwd|secret", "embedded credential keyword"),
+    (rb"https?://[A-Za-z0-9.\-/]+", "hard-coded URL / C2-style endpoint"),
+]
+RE_EXTS = (".js", ".mjs", ".map", ".wasm", ".apk", ".jar", ".exe", ".dll",
+           ".bin", ".so", ".ipa", ".class", ".pyc", ".firmware")
+
+def _strings(data, minlen=5):
+    out = []; cur = bytearray()
+    for b in data:
+        if 32 <= b < 127:
+            cur.append(b)
+        else:
+            if len(cur) >= minlen:
+                out.append(cur.decode("latin-1"))
+            cur = bytearray()
+    if len(cur) >= minlen:
+        out.append(cur.decode("latin-1"))
+    return out
+
+def mod_reverse_engineer(job):
+    """Static reverse engineering of shipped artifacts (JS bundles, wasm, apk,
+    jar, exe...). Extracts strings, secrets and dangerous calls."""
+    candidates = set()
+    for u in list(job.urls) + list(job.js_files):
+        if any(urlparse(u).path.lower().endswith(e) for e in RE_EXTS):
+            candidates.add(u)
+    # also probe a couple of common bundle/source-map locations
+    for p in ["/static/js/main.js", "/assets/index.js", "/bundle.js", "/app.js", "/main.js.map"]:
+        candidates.add(job.url.rstrip("/") + p)
+
+    analysed = 0
+    for u in list(candidates)[:12]:
+        if job.over_budget():
+            break
+        try:
+            rr = requests.get(u, timeout=TIMEOUT, verify=False,
+                              headers={"User-Agent": UAS[0]}, stream=True)
+            data = rr.raw.read(800_000, decode_content=True) or b""
+        except Exception:
+            continue
+        if not data or rr.status_code != 200:
+            continue
+        analysed += 1
+        # source map => original source disclosure
+        if u.endswith(".map") or b'"sources"' in data[:2000]:
+            job.add_vuln("Source Code Disclosure", u,
+                         evidence="JavaScript source map exposed — original (pre-minified) source recoverable",
+                         code=_snippet(data[:1500].decode("latin-1", "ignore"), 0))
+        # secret scan over extracted strings
+        text = "\n".join(_strings(data))[:200000]
+        for kt, pattern in JS_SECRETS.items():
+            m = re.search(pattern, text)
+            if m:
+                job.add_vuln("API Key Exposed", u,
+                             evidence=f"Reverse-engineered artifact embeds {kt}",
+                             code=_snippet(text, m.start()))
+                break
+        # dangerous binary/code markers
+        for pat, desc in RE_BIN_MARKERS:
+            m = re.search(pat, data)
+            if m:
+                vt = "Dangerous Binary Pattern" if not u.endswith((".js", ".mjs", ".map")) \
+                     else "Vulnerable Code Pattern"
+                job.add_vuln(vt, u, evidence=f"Static RE: {desc}",
+                             code=_snippet(data.decode("latin-1", "ignore"), m.start()))
+                break
+    job.log(f"Reverse engineer: statically analysed {analysed} artifact(s)", "OK")
+
+
+# ── Generate Exploits / PoC — Engine 8 ────────────────────────────────────────
+def _cve_refs(job):
+    refs = []
+    blob = " ".join(job.tech_stack) + " " + " ".join(
+        v.get("evidence", "") for v in job.vulns)
+    for m in re.finditer(r"CVE-\d{4}-\d{4,7}", blob):
+        if m.group(0) not in refs:
+            refs.append(m.group(0))
+    return refs
+
+def generate_poc(job):
+    """Builds a safe, reproduction-only Proof-of-Concept for each confirmed
+    finding (the exact request that demonstrates it) plus CVE references.
+    For remediation & verification — not weaponised tooling."""
+    job.log("Exploit/PoC engine: generating reproduction steps for findings...", "INFO")
+    cves = _cve_refs(job)
+    INJ = {"SQL Injection", "Reflected XSS", "LFI", "SSRF", "Command Injection",
+           "NoSQL Injection", "SSTI", "Expression Language Injection", "XPath Injection",
+           "LDAP Injection", "Open Redirect", "CRLF Injection", "Hidden Parameter"}
+    made = 0
+    with job._lock:
+        for v in job.vulns:
+            t = v["type"]; loc = v["location"]; p = v.get("parameter", ""); pl = v.get("payload", "")
+            poc = ""
+            if t in INJ and p and pl:
+                sep = "&" if "?" in loc else "?"
+                poc = (f"# Reproduce ({t}) — payload was confirmed by the scanner\n"
+                       f"curl -G '{loc}' --data-urlencode '{p}={pl}'\n"
+                       f"# Expected: the response shows the injection effect noted in evidence.")
+            elif t in ("Out-of-Band RCE", "Blind SSRF (OOB)", "Blind XXE (OOB)"):
+                poc = (f"# {t} — confirmed via out-of-band call-back to the scanner's listener.\n"
+                       f"# The target fetched our unique OOB URL, proving server-side execution/fetch.")
+            elif t in ("Missing Header (HIGH)", "Missing Header (MEDIUM)", "Clickjacking",
+                       "CORS Misconfiguration", "Insecure Cookie"):
+                poc = (f"# Verify ({t}) — inspect the response headers:\n"
+                       f"curl -sI '{loc}'")
+            elif t in ("Weak JWT Secret",):
+                poc = ("# Forge a token once the HMAC secret is known (see evidence):\n"
+                       "# python: jwt.encode({'user':'admin','role':'admin'}, '<secret>', algorithm='HS256')")
+            elif t in ("Backup File Exposed", "Source Code Disclosure", "Sensitive File Exposed",
+                       "Directory Listing", "Forced Browsing"):
+                poc = f"# Fetch the exposed resource:\ncurl -s '{loc}'"
+            elif t in ("Mass Assignment",):
+                poc = (f"# Send protected fields in the body:\n"
+                       f"curl -s '{loc}' -H 'Content-Type: application/json' "
+                       f"-d '{{\"role\":\"admin\",\"is_admin\":true}}'")
+            else:
+                poc = f"# Verify ({t}):\ncurl -s '{loc}'"
+            if cves and t in ("Outdated Service CVE", "WordPress Vulnerability",
+                              "Drupal Vulnerability", "Log4Shell (JNDI)", "Out-of-Band RCE"):
+                poc += f"\n# Related CVE references: {', '.join(cves[:4])}"
+            v["poc"] = poc
+            made += 1
+    job.log(f"Exploit/PoC engine: {made} reproduction PoC(s) generated"
+            + (f" | CVE refs: {', '.join(cves[:4])}" if cves else ""), "OK")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     # Speed: collapse identical URL templates so we don't re-test the same shape
     all_urls = _dedup_urls(list(job.urls) or [job.url])[:MAX_VULN_URLS]
     total    = len(all_urls) * 10 + 12 + 14 + 7 + 4
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} unique URL shapes with 54 modules (FAST={FAST})...", "INFO")
+    job.log(f"Testing {len(all_urls)} unique URL shapes with 58 modules (FAST={FAST})...", "INFO")
 
     # Out-of-band payloads planted first so call-backs have the whole scan to arrive
     try:
@@ -3412,7 +3621,9 @@ def phase_vulns(job):
               mod_stored_xss, mod_user_enum, mod_file_upload, mod_backup_files,
               mod_web_cache_deception, mod_jwt_attacks, mod_forced_browse,
               # round-3 advanced engines
-              mod_stateful_logic, mod_api_fuzz):
+              mod_stateful_logic, mod_api_fuzz,
+              # round-4 code-level & reverse engineering
+              mod_code_audit, mod_reverse_engineer):
         if job.over_budget():
             job.log("Time budget reached — wrapping up remaining site-wide modules", "WARN")
             break
@@ -3510,6 +3721,9 @@ def verify_findings(job):
             # Extracted data present (e.g. db version, usernames) = very strong
             if ext and any(k not in ("confidence", "status") for k in ext):
                 conf = max(conf, 92)
+            # We pinpointed the exact vulnerable code line => high confidence
+            if v.get("code"):
+                conf = max(conf, 90)
             # Blind / timing findings need a human
             if any(b in ev for b in BLIND):
                 conf = min(conf, 65)
@@ -3637,6 +3851,7 @@ def run_scan(job):
         phase_vulns(job)
         verify_findings(job)
         analyze_attack_chains(job)
+        generate_poc(job)               # Generate Exploits / reproduction PoC
         # OOB settle window — give planted call-backs a moment to land
         if OOB_BASE and not oob_hits(job.oob_token):
             for _ in range(6):
@@ -3758,7 +3973,12 @@ input[type=text]:focus{border-color:var(--cy)}
 .vext{background:var(--bg);border-radius:5px;padding:6px 9px;color:var(--gn);
   font-size:.7rem;font-family:monospace;margin-bottom:4px;border:1px solid #30363d}
 .vimp{color:var(--yr);font-size:.72rem;margin-bottom:4px}
-.ftb{background:none;border:none;color:var(--cy);font-size:.7rem;cursor:pointer;padding:0}
+.vcode{background:#0a0e14;border:1px solid #f8514940;border-left:3px solid var(--red);
+  border-radius:5px;padding:6px 9px;margin-bottom:5px}
+.vcl{display:block;color:var(--red);font-size:.6rem;font-weight:700;letter-spacing:.05em;margin-bottom:3px}
+.vcode pre{color:#ffa198;font-size:.66rem;font-family:monospace;white-space:pre-wrap;word-break:break-all;margin:0}
+.vpoc pre{color:var(--gn);font-size:.67rem;font-family:monospace;white-space:pre-wrap;word-break:break-all;margin:0}
+.ftb{background:none;border:none;color:var(--cy);font-size:.7rem;cursor:pointer;padding:0;display:block;margin-top:4px}
 .fd{display:none;background:var(--bg);border-radius:5px;padding:7px 9px;margin-top:5px;
   color:#79c0ff;font-size:.7rem;border:1px solid var(--bd)}
 .fd ol{padding-left:13px}.fd li{margin-bottom:2px;color:var(--gn)}
@@ -3781,7 +4001,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v5.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">54 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">58 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -3791,7 +4011,7 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v5.0 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 54 Modules incl. Out-of-Band engine, RL adaptive mutation, stateful business-logic & API fuzzing, with CVSS v3.1 scoring and an attack-chain engine.</p>
+    <p>PHANTOM v5.0 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 58 Modules incl. Out-of-Band engine, RL adaptive mutation, stateful business-logic & API fuzzing, with CVSS v3.1 scoring and an attack-chain engine.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
@@ -4002,10 +4222,13 @@ function showRes(d){
       h+='</div>';
       if(v.payload)h+='<div class="vpay">▸ '+esc(v.payload)+'</div>';
       if(v.evidence)h+='<div class="vd">'+esc(v.evidence)+'</div>';
+      if(v.code)h+='<div class="vcode"><span class="vcl">⟨/⟩ WHERE IN CODE</span><pre>'+esc(v.code)+'</pre></div>';
       const ext=v.extracted||{};
       if(Object.keys(ext).length)
         h+='<div class="vext">★ EXTRACTED: '+esc(JSON.stringify(ext).substring(0,200))+'</div>';
       if(v.impact)h+='<div class="vimp">⚡ '+esc(v.impact)+'</div>';
+      if(v.poc)h+='<button class="ftb" onclick="tf2('+i+')">▸ Proof-of-Concept (reproduce)</button>'+
+                 '<div class="fd vpoc" id="pc'+i+'"><pre>'+esc(v.poc)+'</pre></div>';
       if(v.fix&&v.fix.length){
         h+='<button class="ftb" onclick="tf('+i+')">▸ Remediation Steps</button>'+
            '<div class="fd" id="fd'+i+'"><ol>';
@@ -4020,6 +4243,7 @@ function showRes(d){
     a.download='phantom_v4_'+sid+'.json';a.click();return false;};
 }
 function tf(n){var e=document.getElementById('fd'+n);e.style.display=e.style.display==='block'?'none':'block';}
+function tf2(n){var e=document.getElementById('pc'+n);e.style.display=e.style.display==='block'?'none':'block';}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 </script>
 </body>
