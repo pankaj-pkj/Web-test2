@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-PHANTOM v5.0 - ULTIMATE Web Vulnerability Scanner
-Flask Web App | Render.com | All 20+ Modules
+PHANTOM v5.1 - ULTIMATE Web Vulnerability Scanner
+Flask Web App | Render.com | 63 Modules | Keep-Alive Pooling | Parallel Site Scan
 """
 import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,threading,time,uuid,warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor,as_completed
+from functools import partial
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin,urlparse,urlencode,parse_qsl,quote
@@ -26,7 +27,7 @@ except: PW_OK=False
 PORT=int(os.environ.get("PORT",5000))
 THREADS=int(os.environ.get("PHANTOM_THREADS",24)); TIMEOUT=int(os.environ.get("PHANTOM_TIMEOUT",7))
 DEPTH=int(os.environ.get("PHANTOM_DEPTH",3)); MAXURLS=150
-DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.0"
+DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.1"
 FAST=os.environ.get("PHANTOM_FAST","1")!="0"          # speed-first mode (default on)
 SCAN_BUDGET=int(os.environ.get("PHANTOM_BUDGET","300"))# hard time budget (seconds)
 MAX_PARAM=6 if FAST else 12                            # params tested per URL
@@ -39,6 +40,22 @@ app=Flask(__name__); scans={}
 UAS=["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.2 Safari/605.1.15",
      "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"]
+
+# ── Connection pooling: one keep-alive Session per worker thread ──────────────
+# Reusing the TCP+TLS connection instead of paying a fresh handshake on every
+# request is the single biggest scan-speed win when many threads hammer one
+# host. Sessions are thread-local (a requests.Session isn't meant to be shared
+# across threads), and each carries a pool sized to the worker count.
+_TL=threading.local()
+def http():
+    s=getattr(_TL,"s",None)
+    if s is None:
+        s=requests.Session()
+        a=requests.adapters.HTTPAdapter(pool_connections=THREADS,
+                                        pool_maxsize=THREADS,max_retries=0)
+        s.mount("http://",a); s.mount("https://",a)
+        _TL.s=s
+    return s
 
 # ══ CVSS v3.1 ═══════════════════════════════════════════════════════════════
 class CVSSv31:
@@ -134,6 +151,8 @@ class CVSSv31:
         "HTTP Method Override":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="H",a="N"),
         "Vulnerable Code Pattern":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="L",a="N"),
         "Dangerous Binary Pattern":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"),
+        "Race Condition":dict(av="N",ac="H",pr="L",ui="N",s="U",c="L",i="H",a="L"),
+        "Client-Side Template Injection":dict(av="N",ac="L",pr="N",ui="R",s="C",c="L",i="L",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -195,7 +214,7 @@ class WAFFingerprinter:
     def detect(self,url,job):
         result={"waf":None,"confidence":0,"bypass_hint":"None needed","details":[]}
         try:
-            r=requests.get(url+"/?waf_test=<script>alert(1)</script>&id=1 OR 1=1",
+            r=http().get(url+"/?waf_test=<script>alert(1)</script>&id=1 OR 1=1",
                            headers={"User-Agent":UAS[0]},timeout=TIMEOUT,verify=False)
         except: return result
         hlc={k.lower():v.lower() for k,v in r.headers.items()}
@@ -669,6 +688,8 @@ VULN_IMPACT={
     "HTTP Method Override":"Method-override header lets attacker reach DELETE/PUT via POST",
     "Vulnerable Code Pattern":"Dangerous sink/secret in the page's own source — XSS, redirect or leak",
     "Dangerous Binary Pattern":"Risky call/secret found by static reverse-engineering of a shipped artifact",
+    "Race Condition":"No server-side locking — parallel requests bypass limits (coupon/gift-card/quantity abuse)",
+    "Client-Side Template Injection":"Angular/Vue template expression executes in the browser — client-side XSS/sandbox escape",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -738,6 +759,8 @@ VULN_FIX={
     "HTTP Method Override":["Disable X-HTTP-Method-Override / _method handling","Enforce real-method authorization checks"],
     "Vulnerable Code Pattern":["Replace the dangerous sink with a safe API (textContent, trusted-types)","Never hard-code secrets in client code","Serve assets over HTTPS only"],
     "Dangerous Binary Pattern":["Remove embedded secrets from shipped artifacts","Avoid unsafe native calls / weak crypto","Strip debug symbols and source maps from production builds"],
+    "Race Condition":["Use atomic DB operations / row locks for limited resources","Guard critical sections with a mutex or unique constraint","Enforce idempotency keys on state-changing requests"],
+    "Client-Side Template Injection":["Never bind user input into Angular/Vue templates","Use ng-non-bindable / v-pre on untrusted regions","Sanitize interpolation and set a strict CSP"],
 }
 
 
@@ -862,8 +885,8 @@ class ScanJob:
         for attempt in range(2):
             try:
                 t0 = time.time()
-                r  = requests.request(method, url, headers=h, timeout=TIMEOUT,
-                                      verify=False, allow_redirects=allow_redirects, **kw)
+                r  = http().request(method, url, headers=h, timeout=TIMEOUT,
+                                    verify=False, allow_redirects=allow_redirects, **kw)
                 lat = time.time() - t0
                 self._lat.append(lat)
                 if len(self._lat) > 10: self._lat.pop(0)
@@ -943,7 +966,7 @@ def phase_osint(job):
 
     # Server header recon
     try:
-        r = requests.get(job.url, headers={"User-Agent": UAS[0]}, timeout=TIMEOUT, verify=False)
+        r = http().get(job.url, headers={"User-Agent": UAS[0]}, timeout=TIMEOUT, verify=False)
         for lh in ["Server", "X-Powered-By", "X-AspNet-Version", "X-Generator", "X-Runtime"]:
             if lh in r.headers:
                 v = r.headers[lh]
@@ -979,7 +1002,7 @@ def phase_osint(job):
 def _enum_subdomains_crtsh(job):
     """Query crt.sh (public Certificate Transparency) — no API key needed."""
     try:
-        r = requests.get(
+        r = http().get(
             f"https://crt.sh/?q=%.{job.host}&output=json",
             timeout=10, headers={"User-Agent": UAS[0]}
         )
@@ -1138,7 +1161,7 @@ def _chain_redis(job):
 def _chain_elasticsearch(job):
     for port in (9200, 9201):
         try:
-            r = requests.get(f"http://{job.host}:{port}/_cat/indices?v",
+            r = http().get(f"http://{job.host}:{port}/_cat/indices?v",
                              timeout=4, verify=False)
             if r.status_code == 200 and ("green" in r.text or "yellow" in r.text):
                 job.chain(f"Elasticsearch indices listed on port {port} without auth")
@@ -1254,7 +1277,7 @@ def _ssl_deep_analysis(job, port=443):
     # Check HTTP→HTTPS redirect
     try:
         http_url = job.url.replace("https://", "http://")
-        r = requests.get(http_url, timeout=5, verify=False, allow_redirects=False)
+        r = http().get(http_url, timeout=5, verify=False, allow_redirects=False)
         if r.status_code == 200:
             job.add_vuln("SSL/TLS Weakness", job.url,
                          evidence="HTTP version accessible without HTTPS redirect — no HSTS enforcement")
@@ -1598,7 +1621,7 @@ def mod_xxe(job, url):
     for target in xml_urls[:5]:
         for payload in XXE_PAYLOADS:
             try:
-                r = requests.post(target, data=payload,
+                r = http().post(target, data=payload,
                                   headers={"Content-Type":"application/xml",
                                            "User-Agent": UAS[0]},
                                   timeout=TIMEOUT, verify=False)
@@ -1672,7 +1695,7 @@ def mod_graphql(job):
 
         # Test introspection
         try:
-            r2 = requests.post(target,
+            r2 = http().post(target,
                                json={"query": GRAPHQL_INTRO},
                                headers={"Content-Type":"application/json","User-Agent":UAS[0]},
                                timeout=TIMEOUT, verify=False)
@@ -1685,7 +1708,7 @@ def mod_graphql(job):
                 job.chain(f"GraphQL schema fully exposed — {types} types enumerable for targeted attacks")
 
             # Test deeply nested query (DoS potential)
-            r3 = requests.post(target,
+            r3 = http().post(target,
                                json={"query": GRAPHQL_DEEP},
                                headers={"Content-Type":"application/json","User-Agent":UAS[0]},
                                timeout=8, verify=False)
@@ -1696,7 +1719,7 @@ def mod_graphql(job):
 
             # Batch query abuse
             batch = [{"query": "{__typename}"}] * 50
-            r4 = requests.post(target, json=batch,
+            r4 = http().post(target, json=batch,
                                headers={"Content-Type":"application/json","User-Agent":UAS[0]},
                                timeout=TIMEOUT, verify=False)
             if r4 and r4.status_code == 200 and "data" in r4.text:
@@ -1787,7 +1810,7 @@ def mod_cache_poison(job, url):
     """Test unkeyed headers for cache poisoning."""
     for hdr, val in CACHE_HEADERS:
         try:
-            r = requests.get(url, headers={hdr: val, "User-Agent": UAS[0],
+            r = http().get(url, headers={hdr: val, "User-Agent": UAS[0],
                                            "Cache-Control": "no-cache"},
                              timeout=TIMEOUT, verify=False)
             if not r:
@@ -1959,7 +1982,7 @@ def mod_rate_limit(job):
         limited = False
         for i in range(15):
             try:
-                r = requests.get(target, headers={"User-Agent": UAS[i % len(UAS)]},
+                r = http().get(target, headers={"User-Agent": UAS[i % len(UAS)]},
                                  timeout=3, verify=False)
                 if r.status_code == 429 or "too many" in r.text.lower() or "rate limit" in r.text.lower():
                     limited = True
@@ -2397,7 +2420,7 @@ def mod_subdomain_takeover(job):
     def check(sub):
         for scheme in ("https://", "http://"):
             try:
-                r = requests.get(scheme + sub, timeout=TIMEOUT, verify=False,
+                r = http().get(scheme + sub, timeout=TIMEOUT, verify=False,
                                  headers={"User-Agent": UAS[0]}, allow_redirects=True)
             except Exception:
                 continue
@@ -2575,7 +2598,7 @@ def mod_cloud_storage(job):
     def probe(item):
         provider, u = item
         try:
-            r = requests.get(u, timeout=TIMEOUT, verify=False,
+            r = http().get(u, timeout=TIMEOUT, verify=False,
                              headers={"User-Agent": UAS[0]})
         except Exception:
             return None
@@ -3441,7 +3464,7 @@ def mod_reverse_engineer(job):
         if job.over_budget():
             break
         try:
-            rr = requests.get(u, timeout=TIMEOUT, verify=False,
+            rr = http().get(u, timeout=TIMEOUT, verify=False,
                               headers={"User-Agent": UAS[0]}, stream=True)
             data = rr.raw.read(800_000, decode_content=True) or b""
         except Exception:
@@ -3532,13 +3555,133 @@ def generate_poc(job):
             + (f" | CVE refs: {', '.join(cves[:4])}" if cves else ""), "OK")
 
 
+# ══ ROUND-5 MODULES (modern additions) ═══════════════════════════════════════
+# ── Race condition / TOCTOU (parallel-request limit bypass) ───────────────────
+RACE_HINTS = ("coupon","promo","voucher","redeem","apply","claim","vote","like",
+              "follow","transfer","withdraw","purchase","checkout","cart","gift",
+              "bonus","reward","referral","invite","balance","point","upvote")
+
+def mod_race_condition(job, url):
+    """Race condition / TOCTOU: fire many identical requests simultaneously at a
+    limited-action endpoint and see if the app lacks server-side locking — the
+    root cause of coupon double-spend, gift-card drain and quantity abuse."""
+    p = urlparse(url)
+    if not any(h in (p.path + "?" + p.query).lower() for h in RACE_HINTS):
+        return
+    base = job.req(url)
+    if not base or base.status_code >= 500:
+        return
+    N = 15
+    def fire():
+        try:
+            r = http().get(url, headers={"User-Agent": UAS[0]}, timeout=TIMEOUT, verify=False)
+            return r.status_code
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=N) as ex:
+        codes = [f.result() for f in [ex.submit(fire) for _ in range(N)]]
+    ok        = [c for c in codes if c in (200, 201, 302)]
+    throttled = any(c == 429 for c in codes)
+    # Almost every simultaneous hit succeeded and nothing was throttled/locked →
+    # the action very likely has no atomic guard around the limited resource.
+    if not throttled and len(ok) >= int(N * 0.8):
+        job.add_vuln("Race Condition", url,
+                     payload=f"{N} concurrent requests",
+                     evidence=f"{len(ok)}/{N} simultaneous requests to a limited-action "
+                              f"endpoint succeeded with no rate-limit/lock — TOCTOU likely")
+        job.chain(f"Race window on {p.path} — parallel requests can over-redeem / over-spend")
+
+
+# ── Client-Side Template Injection (AngularJS / Vue) ──────────────────────────
+CSTI_FRAMEWORKS = ("ng-app","ng-version","ng-controller","data-ng-","x-ng-",
+                   "v-bind","v-model","v-for","__vue__","vue.js","vue.min.js",
+                   "angular.js","angular.min.js")
+
+def mod_csti(job, url):
+    """Client-Side Template Injection. Unlike SSTI (evaluated on the server),
+    a CSTI expression is evaluated in the browser by a client-side templating
+    engine, so we flag an un-rendered template expression reflected into a page
+    that ships Angular/Vue."""
+    p = urlparse(url)
+    if not p.query:
+        return
+    params = dict(parse_qsl(p.query))
+    marker = "{{7913*3}}"                     # a server would never produce 23739 here
+    for param in list(params)[:MAX_PARAM]:
+        if job.over_budget():
+            return
+        test = dict(params); test[param] = marker
+        test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(test)}"
+        r = job.req(test_url)
+        if not r or marker not in r.text:
+            continue
+        fw = [f for f in CSTI_FRAMEWORKS if f in r.text.lower()]
+        if fw:
+            job.add_vuln("Client-Side Template Injection", url, param=param,
+                         payload=marker,
+                         evidence=f"Template expression reflected unescaped into a client-side "
+                                  f"templating app ({fw[0]}) — evaluates in the browser (CSTI → XSS)",
+                         code=_snippet(r.text, r.text.find(marker)))
+            return
+
+
+# ── Source-map disclosure (derive .map from bundles → original source) ────────
+def mod_sourcemap(job):
+    """Derive <bundle>.js.map from every discovered JS asset and confirm the
+    original, pre-minified source is recoverable. Complements the reverse
+    engineer (which only reads maps that are linked or guessed by fixed path)."""
+    js = [u for u in list(job.js_files) + list(job.urls)
+          if urlparse(u).path.lower().endswith((".js", ".mjs"))]
+    seen = set(); checked = 0; found = 0
+    for u in js:
+        if job.over_budget() or checked >= 8:
+            break
+        mp = u.split("?")[0] + ".map"
+        if mp in seen:
+            continue
+        seen.add(mp)
+        r = job.req(mp)
+        if not r or r.status_code != 200:
+            continue
+        checked += 1
+        head = r.text[:4000]
+        if '"sources"' in head or ('"version"' in head and '"mappings"' in head):
+            found += 1
+            has_src = '"sourcesContent"' in r.text
+            job.add_vuln("Source Code Disclosure", mp,
+                         evidence=("Source map exposed" +
+                                   (" with inlined original source (sourcesContent) — full "
+                                    "pre-minified code recoverable" if has_src
+                                    else " — original file/route structure recoverable")),
+                         code=_snippet(r.text, 0))
+    if checked:
+        job.log(f"Source-map scan: checked {checked} bundle map(s), {found} exposed", "OK")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     # Speed: collapse identical URL templates so we don't re-test the same shape
     all_urls = _dedup_urls(list(job.urls) or [job.url])[:MAX_VULN_URLS]
-    total    = len(all_urls) * 10 + 12 + 14 + 7 + 4
+
+    # Per-URL modules run for every unique URL shape; site-wide modules run once.
+    per_url_mods = (mod_sqli, mod_xss, mod_lfi, mod_ssrf, mod_cmdi, mod_idor,
+                    mod_redirect, mod_hpp, mod_business_logic, mod_cache_poison,
+                    mod_secrets_scan, mod_nosqli, mod_crlf, mod_ssti_advanced,
+                    mod_el_injection, mod_xpath_ldap, mod_param_mining,
+                    mod_verbose_errors, mod_adaptive_fuzz, mod_csti)
+    site_mods = (mod_graphql, mod_oauth, mod_cms_deep, mod_rate_limit, mod_csp,
+                 mod_cors, mod_headers, mod_cookies, mod_files, mod_fingerprint,
+                 mod_host_header, mod_subdomain_takeover, mod_dom_xss,
+                 mod_deserialization, mod_http_methods, mod_dir_listing,
+                 mod_mixed_content, mod_email_security, mod_cloud_storage,
+                 mod_log4shell, mod_tabnabbing, mod_cache_control, mod_websocket,
+                 mod_well_known, mod_stored_xss, mod_user_enum, mod_file_upload,
+                 mod_backup_files, mod_web_cache_deception, mod_jwt_attacks,
+                 mod_forced_browse, mod_stateful_logic, mod_api_fuzz,
+                 mod_code_audit, mod_reverse_engineer, mod_sourcemap)
+    total = len(all_urls) * len(per_url_mods) + len(site_mods) + 2 + 2 + 4 + 5
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} unique URL shapes with 58 modules (FAST={FAST})...", "INFO")
+    job.log(f"Testing {len(all_urls)} unique URL shapes with 63 modules (FAST={FAST})...", "INFO")
 
     # Out-of-band payloads planted first so call-backs have the whole scan to arrive
     try:
@@ -3547,34 +3690,19 @@ def phase_vulns(job):
         job.log(f"mod_oob_inject error: {str(e)[:60]}", "WARN")
     job.advance("Phase 3: Vulns & Exploits", 4)
 
-    # Per-URL tests (parallelized)
+    # Per-URL tests (parallelized across URL shapes)
     def scan_url(url):
         if job.over_budget():
             return
-        mod_sqli(job, url)
-        mod_xss(job, url)
-        mod_lfi(job, url)
-        mod_ssrf(job, url)
-        mod_cmdi(job, url)
-        mod_idor(job, url)
-        mod_redirect(job, url)
-        mod_hpp(job, url)
-        mod_business_logic(job, url)
-        mod_cache_poison(job, url)
-        mod_secrets_scan(job, url)
-        mod_nosqli(job, url)
-        mod_crlf(job, url)
-        mod_ssti_advanced(job, url)
-        mod_el_injection(job, url)
-        mod_xpath_ldap(job, url)
-        mod_param_mining(job, url)
-        mod_verbose_errors(job, url)
-        mod_adaptive_fuzz(job, url)
-        job.advance("Phase 3: Vulns & Exploits", 10)
+        for m in per_url_mods:
+            try:
+                m(job, url)
+            except Exception:
+                pass
+            job.advance("Phase 3: Vulns & Exploits")
 
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futs = [ex.submit(scan_url, u) for u in all_urls]
-        for fut in as_completed(futs):
+        for fut in as_completed([ex.submit(scan_url, u) for u in all_urls]):
             try:
                 fut.result()
             except:
@@ -3585,53 +3713,38 @@ def phase_vulns(job):
     mod_xss_forms(job)
     job.advance("Phase 3: Vulns & Exploits", 2)
 
-    # Site-wide tests (run once)
-    mod_xxe(job, job.url)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_request_smuggling(job, job.url)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_graphql(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_oauth(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_cms_deep(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_rate_limit(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_csp(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_cors(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_headers(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_cookies(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_files(job)
-    job.advance("Phase 3: Vulns & Exploits")
-    mod_fingerprint(job)
-    job.advance("Phase 3: Vulns & Exploits")
+    # Site-wide tests — all independent, so run them concurrently for speed.
+    site_tasks = [partial(mod_xxe, job, job.url),
+                  partial(mod_request_smuggling, job, job.url)]
+    site_tasks += [partial(m, job) for m in site_mods]
 
-    # ── Extended site-wide modules ────────────────────────────────────────────
-    for m in (mod_host_header, mod_subdomain_takeover, mod_dom_xss,
-              mod_deserialization, mod_http_methods, mod_dir_listing,
-              mod_mixed_content, mod_email_security, mod_cloud_storage,
-              mod_log4shell, mod_tabnabbing, mod_cache_control,
-              mod_websocket, mod_well_known,
-              # round-2 site-wide
-              mod_stored_xss, mod_user_enum, mod_file_upload, mod_backup_files,
-              mod_web_cache_deception, mod_jwt_attacks, mod_forced_browse,
-              # round-3 advanced engines
-              mod_stateful_logic, mod_api_fuzz,
-              # round-4 code-level & reverse engineering
-              mod_code_audit, mod_reverse_engineer):
+    def run_site(task):
         if job.over_budget():
-            job.log("Time budget reached — wrapping up remaining site-wide modules", "WARN")
+            return
+        try:
+            task()
+        except Exception as e:
+            job.log(f"{getattr(task.func, '__name__', 'module')} error: {str(e)[:60]}", "WARN")
+        job.advance("Phase 3: Vulns & Exploits")
+
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        for fut in as_completed([ex.submit(run_site, t) for t in site_tasks]):
+            try:
+                fut.result()
+            except:
+                pass
+
+    # Race-condition sweep — only endpoints that look like a limited action, capped.
+    race_urls = [u for u in all_urls
+                 if any(h in u.lower() for h in RACE_HINTS)][:5]
+    for u in race_urls:
+        if job.over_budget():
             break
         try:
-            m(job)
-        except Exception as e:
-            job.log(f"{m.__name__} error: {str(e)[:60]}", "WARN")
-        job.advance("Phase 3: Vulns & Exploits")
+            mod_race_condition(job, u)
+        except Exception:
+            pass
+    job.advance("Phase 3: Vulns & Exploits", 5)
 
 
 # ══ MAIN SCAN RUNNER ══════════════════════════════════════════════════════════
@@ -3877,7 +3990,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PHANTOM v5.0 — Ultimate Web Scanner</title>
+<title>PHANTOM v5.1 — Ultimate Web Scanner</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#080c10;--bg2:#0d1117;--bg3:#161b22;--bd:#21262d;
@@ -4001,7 +4114,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v5.0</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">58 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.1</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">63 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -4011,12 +4124,12 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v5.0 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 58 Modules incl. Out-of-Band engine, RL adaptive mutation, stateful business-logic & API fuzzing, with CVSS v3.1 scoring and an attack-chain engine.</p>
+    <p>PHANTOM v5.1 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 63 Modules incl. Out-of-Band engine, RL adaptive mutation, race-condition/TOCTOU, client-side template injection, source-map recovery, stateful business-logic & API fuzzing — with keep-alive connection pooling and a parallel site-wide scan for speed, CVSS v3.1 scoring and an attack-chain engine.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
     </div>
-    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.0</button>
+    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.1</button>
     <div id="err-box" style="display:none;margin-top:10px;background:#f8514918;border:1px solid #f8514960;
       border-radius:8px;padding:10px 14px;color:#f85149;font-size:.8rem;font-family:monospace"></div>
     <div class="qt" style="margin-top:10px">
@@ -4093,7 +4206,7 @@ const PH=['Phase 0: OSINT & Recon','Phase 1: Port Scan','Phase 2: Spider & JS','
 function su(u){document.getElementById('iu').value=u;return false}
 function showErr(msg){
   const b=document.getElementById('sb');
-  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.0';
+  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.1';
   document.getElementById('fa').style.display='block';
   document.getElementById('pa').style.display='none';
   const eb=document.getElementById('err-box');
@@ -4240,7 +4353,7 @@ function showRes(d){
   document.getElementById('dl').onclick=()=>{
     const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);
-    a.download='phantom_v4_'+sid+'.json';a.click();return false;};
+    a.download='phantom_v5_'+sid+'.json';a.click();return false;};
 }
 function tf(n){var e=document.getElementById('fd'+n);e.style.display=e.style.display==='block'?'none':'block';}
 function tf2(n){var e=document.getElementById('pc'+n);e.style.display=e.style.display==='block'?'none':'block';}
@@ -4319,9 +4432,11 @@ def oob_collect_endpoint(token, rest):
 def health():
     active = sum(1 for s in scans.values() if s.status=="running")
     return jsonify({"status":"ok","version":VER,"active_scans":active,
+                    "modules":63,"pooling":True,
                     "oob_ready":bool(OOB_BASE),"headless":PW_OK,"fast":FAST})
 
 if __name__ == "__main__":
     print(f"[*] PHANTOM v{VER} starting on port {PORT}")
+    print(f"[*] 63 modules | keep-alive pooling | parallel site scan | FAST={FAST}")
     print(f"[*] Open: http://localhost:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
