@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PHANTOM v5.1 - ULTIMATE Web Vulnerability Scanner
-Flask Web App | Render.com | 63 Modules | Keep-Alive Pooling | Parallel Site Scan
+PHANTOM v5.2 - ULTIMATE Web Vulnerability Scanner
+Flask Web App | Render.com | 66 Modules | Real-Browser Traffic | WAF-Aware Mutation
 """
 import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,threading,time,uuid,warnings
 from collections import deque
@@ -27,7 +27,7 @@ except: PW_OK=False
 PORT=int(os.environ.get("PORT",5000))
 THREADS=int(os.environ.get("PHANTOM_THREADS",24)); TIMEOUT=int(os.environ.get("PHANTOM_TIMEOUT",7))
 DEPTH=int(os.environ.get("PHANTOM_DEPTH",3)); MAXURLS=150
-DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.1"
+DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.2"
 FAST=os.environ.get("PHANTOM_FAST","1")!="0"          # speed-first mode (default on)
 SCAN_BUDGET=int(os.environ.get("PHANTOM_BUDGET","300"))# hard time budget (seconds)
 MAX_PARAM=6 if FAST else 12                            # params tested per URL
@@ -56,6 +56,37 @@ def http():
         s.mount("http://",a); s.mount("https://",a)
         _TL.s=s
     return s
+
+# ── Human-like request fingerprint ───────────────────────────────────────────
+# A bare bot sends 3 headers; a real Chrome/Firefox sends a coherent set of
+# Client Hints (sec-ch-ua*) and Fetch Metadata (Sec-Fetch-*). Passive WAF /
+# Cloudflare bot checks key off exactly these, so we mirror a genuine browser
+# session (matching UA↔hints, a same-site Referer, keep-alive + cookie reuse).
+def realistic_headers(ua, referer=None):
+    # Only Chromium-family browsers emit Client Hints; Firefox/Safari do not.
+    is_chromium = "Chrome" in ua and "Firefox" not in ua
+    h = {
+        "User-Agent": ua,
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                   "application/signed-exchange;v=b3;q=0.7"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if referer else "none",
+        "Sec-Fetch-User": "?1",
+    }
+    if referer:
+        h["Referer"] = referer
+    if is_chromium:                     # Client Hints only for Chrome/Chromium
+        h["sec-ch-ua"] = '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'
+        h["sec-ch-ua-mobile"] = "?0"
+        h["sec-ch-ua-platform"] = '"macOS"' if "Mac OS" in ua else '"Windows"'
+    return h
 
 # ══ CVSS v3.1 ═══════════════════════════════════════════════════════════════
 class CVSSv31:
@@ -153,6 +184,9 @@ class CVSSv31:
         "Dangerous Binary Pattern":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"),
         "Race Condition":dict(av="N",ac="H",pr="L",ui="N",s="U",c="L",i="H",a="L"),
         "Client-Side Template Injection":dict(av="N",ac="L",pr="N",ui="R",s="C",c="L",i="L",a="N"),
+        "JSONP Endpoint":dict(av="N",ac="L",pr="N",ui="R",s="C",c="H",i="N",a="N"),
+        "GraphQL CSRF":dict(av="N",ac="L",pr="N",ui="R",s="U",c="L",i="H",a="N"),
+        "Information Leak (Comment)":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -327,8 +361,34 @@ class AdaptiveMutator:
             return payload
         return payload
 
+    # Transforms that historically slip past each WAF family (used to warm-start
+    # the bandit so it exploits known-good evasions before exploring blindly).
+    WAF_HINTS = {
+        "Cloudflare":  ["case_swap", "unicode_esc", "mixed_keyword"],
+        "ModSecurity": ["comment_break", "null_byte", "ws_alt"],
+        "AWS WAF":     ["double_url", "url_encode", "mixed_keyword"],
+        "Akamai":      ["ws_alt", "url_encode", "case_swap"],
+        "Incapsula":   ["mixed_keyword", "comment_break", "case_swap"],
+        "Imperva":     ["mixed_keyword", "comment_break", "case_swap"],
+        "Sucuri":      ["url_encode", "case_swap"],
+        "F5 BIG-IP":   ["double_url", "ws_alt"],
+        "Barracuda":   ["comment_break", "url_encode"],
+        "FortiWeb":    ["ws_alt", "mixed_keyword"],
+    }
+    def warm_start(self, waf):
+        """Seed the bandit toward transforms known to evade this WAF family, so
+        it starts by exploiting them instead of exploring from scratch."""
+        if not waf:
+            return []
+        picks = self.WAF_HINTS.get(waf, ["url_encode", "case_swap"])
+        with self._lock:
+            for s in picks:
+                if s in self.Q:
+                    self.Q[s] = max(self.Q[s], 0.6)   # optimistic prior
+                    self.N[s] += 1
+        return picks
+
     def select(self):
-        import random
         with self._lock:
             if random.random() < self.eps:
                 return random.choice(list(self.Q))
@@ -690,6 +750,9 @@ VULN_IMPACT={
     "Dangerous Binary Pattern":"Risky call/secret found by static reverse-engineering of a shipped artifact",
     "Race Condition":"No server-side locking — parallel requests bypass limits (coupon/gift-card/quantity abuse)",
     "Client-Side Template Injection":"Angular/Vue template expression executes in the browser — client-side XSS/sandbox escape",
+    "JSONP Endpoint":"Callback-wrapped JSON readable cross-origin — any site can steal the data (leaky CORS bypass)",
+    "GraphQL CSRF":"Mutations accepted via GET/form-encoded — state-changing GraphQL calls forgeable cross-site",
+    "Information Leak (Comment)":"Developer comment leaks paths, credentials, TODOs or internal endpoints",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -761,6 +824,9 @@ VULN_FIX={
     "Dangerous Binary Pattern":["Remove embedded secrets from shipped artifacts","Avoid unsafe native calls / weak crypto","Strip debug symbols and source maps from production builds"],
     "Race Condition":["Use atomic DB operations / row locks for limited resources","Guard critical sections with a mutex or unique constraint","Enforce idempotency keys on state-changing requests"],
     "Client-Side Template Injection":["Never bind user input into Angular/Vue templates","Use ng-non-bindable / v-pre on untrusted regions","Sanitize interpolation and set a strict CSP"],
+    "JSONP Endpoint":["Replace JSONP with CORS + an allow-list of origins","Never wrap sensitive data in an attacker-named callback","Require authentication and anti-CSRF on data endpoints"],
+    "GraphQL CSRF":["Only accept mutations over POST with application/json","Reject GET/form-encoded GraphQL mutations","Enforce a CSRF token / SameSite cookies on the endpoint"],
+    "Information Leak (Comment)":["Strip HTML/JS comments from production builds","Never leave credentials or internal paths in markup","Add a build step that removes developer comments"],
 }
 
 
@@ -771,6 +837,9 @@ class ScanJob:
         self.id          = str(uuid.uuid4())[:8]
         self.url         = url.rstrip("/")
         self.host        = urlparse(url).hostname or url
+        _p               = urlparse(self.url)
+        self.ua          = random.choice(UAS)   # one stable UA per scan (real browsers don't rotate)
+        self._origin     = f"{_p.scheme}://{_p.netloc}"
         self.status      = "running"
         self.logs        = deque(maxlen=300)
         self.vulns       = []
@@ -871,12 +940,9 @@ class ScanJob:
         self.elapsed       = round(time.time() - self.start, 1)
 
     def req(self, url, method="GET", waf_bypass=False, **kw):
-        h = {
-            "User-Agent":    UAS[self._ua % len(UAS)],
-            "Accept":        "text/html,*/*;q=0.8",
-            "Accept-Language":"en-US,en;q=0.5",
-            "Connection":    "keep-alive",
-        }
+        # Present as a real browser session (coherent Client Hints + Fetch
+        # Metadata + same-site Referer) so passive WAF/Cloudflare checks pass.
+        h = realistic_headers(self.ua, referer=self._origin)
         # Merge caller-supplied headers instead of colliding with the defaults
         h.update(kw.pop("headers", None) or {})
         # Let callers override redirect behaviour without a kwarg collision
@@ -891,8 +957,10 @@ class ScanJob:
                 self._lat.append(lat)
                 if len(self._lat) > 10: self._lat.pop(0)
                 avg = sum(self._lat) / len(self._lat)
+                # Adaptive throttle + a little human-like jitter so traffic isn't
+                # perfectly mechanical (kept tiny to preserve scan speed).
                 self._delay = min(DELAY + max(0, avg - 0.5) * 0.1, 2.0)
-                time.sleep(self._delay)
+                time.sleep(self._delay + random.uniform(0, 0.03))
                 if r.status_code == 403 and waf_bypass and attempt == 0:
                     if "params" in kw:
                         kw["params"] = {k: quote(str(v)) for k, v in kw["params"].items()}
@@ -954,6 +1022,12 @@ def phase_osint(job):
     # WAF fingerprint
     waf_result = WAF_ENGINE.detect(job.url, job)
     job.waf_info = waf_result
+    # Warm-start the RL mutator toward evasions known to work against this WAF.
+    if waf_result.get("waf"):
+        picks = job.mutator.warm_start(waf_result["waf"])
+        if picks:
+            job.log(f"Mutator warm-started for {waf_result['waf']}: "
+                    f"{', '.join(picks)}", "INFO")
     job.advance("Phase 0: OSINT & Recon")
 
     # Subdomain enumeration via crt.sh (public certificate transparency)
@@ -3658,6 +3732,103 @@ def mod_sourcemap(job):
         job.log(f"Source-map scan: checked {checked} bundle map(s), {found} exposed", "OK")
 
 
+# ── JSONP endpoint (cross-origin data theft via callback) ─────────────────────
+JSONP_PARAMS = ("callback", "cb", "jsonp", "json_callback", "jsoncallback",
+                "jsonpcallback", "cbfnc", "onjsonpcallback")
+
+def mod_jsonp(job, url):
+    """JSONP endpoints wrap JSON in an attacker-named callback, so any origin can
+    <script>-include them and read the data — a classic same-origin bypass."""
+    p = urlparse(url)
+    params = dict(parse_qsl(p.query))
+    marker = "phantomJsonp1337"
+    # try existing callback-ish params first, then inject one
+    test_params = [k for k in params if k.lower() in JSONP_PARAMS] or ["callback"]
+    for cbp in test_params[:2]:
+        q = dict(params); q[cbp] = marker
+        test_url = f"{p.scheme}://{p.netloc}{p.path}?{urlencode(q)}"
+        r = job.req(test_url)
+        if not r or r.status_code != 200:
+            continue
+        ctype = r.headers.get("Content-Type", "").lower()
+        body  = r.text.lstrip()
+        # Callback must wrap the payload AND the body must look like data, not HTML.
+        if body.startswith(marker + "(") and "html" not in ctype:
+            job.add_vuln("JSONP Endpoint", url, param=cbp, payload=f"{cbp}={marker}",
+                         evidence=f"Response wrapped in attacker-controlled callback "
+                                  f"'{marker}(...)' (Content-Type: {ctype or 'n/a'}) — "
+                                  f"data readable cross-origin via <script> include",
+                         code=_snippet(r.text, 0))
+            job.chain(f"JSONP on {p.path} — any site can exfiltrate this data for a logged-in victim")
+            return
+
+
+# ── GraphQL CSRF (state-changing mutations over GET / form-encoded) ───────────
+def mod_graphql_csrf(job):
+    """A GraphQL endpoint that accepts queries over GET or as form-encoded POST
+    can be triggered cross-site (CSRF) — no JSON preflight to stop the browser."""
+    for ep in ("/graphql", "/api/graphql", "/v1/graphql", "/query"):
+        target = job.url + ep
+        # GET-based query
+        r = job.req(target + "?query=" + quote("{__typename}"))
+        get_ok = r is not None and r.status_code == 200 and "__typename" in (r.text or "")
+        # form-encoded POST (browser-forgeable, unlike application/json)
+        form_ok = False
+        rf = job.req(target, method="POST", data={"query": "{__typename}"},
+                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if rf is not None and rf.status_code == 200 and "__typename" in (rf.text or ""):
+            form_ok = True
+        if get_ok or form_ok:
+            how = "GET query string" if get_ok else "form-encoded POST"
+            job.add_vuln("GraphQL CSRF", target, payload="{__typename}",
+                         evidence=f"GraphQL executes via {how} — a browser can be forced "
+                                  f"to send mutations cross-site (no JSON preflight barrier)")
+            job.chain(f"GraphQL CSRF at {ep} — forge state-changing mutations against logged-in users")
+            return
+
+
+# ── Developer-comment information leak ────────────────────────────────────────
+COMMENT_SIGNALS = [
+    (re.compile(r"(?i)(?:password|passwd|pwd|secret|api[_-]?key|token|credential)\s*[:=]"),
+     "credential-like value"),
+    (re.compile(r"(?i)\b(?:todo|fixme|hack|debug|backdoor|remove before|do not commit)\b"),
+     "developer note"),
+    (re.compile(r"(?i)(?:https?://(?:localhost|127\.0\.0\.1|192\.168\.|10\.)|/admin|/internal|/staging|/debug)"),
+     "internal path/host"),
+]
+
+def mod_secrets_comments(job):
+    """Extract HTML/JS comments from the homepage and a few crawled pages and
+    flag credentials, internal paths and revealing developer notes left behind."""
+    pages = [job.url] + [u for u in list(job.urls) if "?" not in u][:4]
+    seen = set(); flagged = 0
+    for u in pages:
+        if job.over_budget():
+            break
+        r = job.req(u)
+        if not r or not r.text:
+            continue
+        comments = re.findall(r"<!--(.*?)-->", r.text, re.DOTALL)
+        comments += re.findall(r"/\*(.*?)\*/", r.text, re.DOTALL)
+        for c in comments:
+            c = c.strip()
+            if len(c) < 6 or c in seen:
+                continue
+            seen.add(c)
+            for rx, kind in COMMENT_SIGNALS:
+                m = rx.search(c)
+                if m:
+                    flagged += 1
+                    job.add_vuln("Information Leak (Comment)", u,
+                                 evidence=f"HTML/JS comment leaks a {kind}",
+                                 code=_snippet(c, m.start()))
+                    break
+        if flagged >= 6:
+            break
+    if flagged:
+        job.log(f"Comment scan: {flagged} revealing comment(s) found", "WARN")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     # Speed: collapse identical URL templates so we don't re-test the same shape
@@ -3668,20 +3839,21 @@ def phase_vulns(job):
                     mod_redirect, mod_hpp, mod_business_logic, mod_cache_poison,
                     mod_secrets_scan, mod_nosqli, mod_crlf, mod_ssti_advanced,
                     mod_el_injection, mod_xpath_ldap, mod_param_mining,
-                    mod_verbose_errors, mod_adaptive_fuzz, mod_csti)
-    site_mods = (mod_graphql, mod_oauth, mod_cms_deep, mod_rate_limit, mod_csp,
-                 mod_cors, mod_headers, mod_cookies, mod_files, mod_fingerprint,
-                 mod_host_header, mod_subdomain_takeover, mod_dom_xss,
-                 mod_deserialization, mod_http_methods, mod_dir_listing,
+                    mod_verbose_errors, mod_adaptive_fuzz, mod_csti, mod_jsonp)
+    site_mods = (mod_graphql, mod_graphql_csrf, mod_oauth, mod_cms_deep,
+                 mod_rate_limit, mod_csp, mod_cors, mod_headers, mod_cookies,
+                 mod_files, mod_fingerprint, mod_host_header, mod_subdomain_takeover,
+                 mod_dom_xss, mod_deserialization, mod_http_methods, mod_dir_listing,
                  mod_mixed_content, mod_email_security, mod_cloud_storage,
                  mod_log4shell, mod_tabnabbing, mod_cache_control, mod_websocket,
                  mod_well_known, mod_stored_xss, mod_user_enum, mod_file_upload,
                  mod_backup_files, mod_web_cache_deception, mod_jwt_attacks,
                  mod_forced_browse, mod_stateful_logic, mod_api_fuzz,
-                 mod_code_audit, mod_reverse_engineer, mod_sourcemap)
+                 mod_code_audit, mod_reverse_engineer, mod_sourcemap,
+                 mod_secrets_comments)
     total = len(all_urls) * len(per_url_mods) + len(site_mods) + 2 + 2 + 4 + 5
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} unique URL shapes with 63 modules (FAST={FAST})...", "INFO")
+    job.log(f"Testing {len(all_urls)} unique URL shapes with 66 modules (FAST={FAST})...", "INFO")
 
     # Out-of-band payloads planted first so call-backs have the whole scan to arrive
     try:
@@ -3862,6 +4034,7 @@ def analyze_attack_chains(job):
     types = {v["type"] for v in job.vulns}
     ports = {p["port"] for p in job.ports}
     has_secret = len(job.secrets) > 0 or "API Key Exposed" in types
+    has_forms  = len(job.forms) > 0
     n_before   = len(job.chains)
 
     def has_any(*names):
@@ -3943,6 +4116,63 @@ def analyze_attack_chains(job):
     if has_any("Verbose Error Disclosure") and len(types) > 3:
         job.chain("ATTACK PATH: verbose errors reveal stack/paths -> attacker fine-tunes the other findings into reliable exploits")
 
+    # ── Extended correlations (round 3 — fresh chains) ────────────────────────
+    # Source/backup/sourcemap disclosure -> hardcoded secret -> authenticated pivot
+    if has_any("Source Code Disclosure") and (has_secret or has_any("API Key Exposed")):
+        job.chain("ATTACK PATH: source-map/source disclosure -> recover embedded API keys & endpoints -> authenticate & pivot into the backend")
+    # CSTI / DOM XSS -> SPA token theft (SPAs keep JWTs in JS-reachable storage)
+    if has_any("Client-Side Template Injection", "DOM XSS") and has_any("Weak JWT Secret", "API Misconfiguration"):
+        job.chain("ATTACK PATH: client-side injection in the SPA -> read the JWT from localStorage -> replay/forge it against the API")
+    elif has_any("Client-Side Template Injection"):
+        job.chain("ATTACK PATH: client-side template injection -> arbitrary JS in the victim's session -> account/session takeover")
+    # JSONP -> cross-origin data theft, and JSONP callback as an XSS vector
+    if has_any("JSONP Endpoint"):
+        job.chain("ATTACK PATH: JSONP endpoint -> any attacker page reads a logged-in victim's private data cross-origin (and the callback param is a reflected-XSS sink)")
+    # GraphQL CSRF + mutations -> forged state changes; with introspection it's precise
+    if has_any("GraphQL CSRF") and has_any("GraphQL Introspection"):
+        job.chain("ATTACK PATH: GraphQL introspection maps every mutation -> CSRF-able GET/form transport -> forge exact state-changing calls against logged-in users")
+    elif has_any("GraphQL CSRF"):
+        job.chain("ATTACK PATH: GraphQL CSRF -> a malicious page silently triggers mutations in the victim's authenticated session")
+    # Race condition -> monetary / limit abuse, amplified by no rate limiting
+    if has_any("Race Condition"):
+        job.chain("ATTACK PATH: race condition (no locking) -> parallel requests over-redeem coupons / drain gift-cards / exceed quantity limits before the balance updates")
+    # IDOR + user enumeration -> mass account data harvest
+    if has_any("IDOR") and has_any("User Enumeration"):
+        job.chain("ATTACK PATH: enumerate valid user IDs -> walk them through the IDOR -> bulk-harvest every user's private records")
+    # SSRF + cloud key -> full cloud account takeover via metadata
+    if has_any("SSRF") and has_any("API Key Exposed"):
+        job.chain("ATTACK PATH: SSRF to the metadata endpoint -> steal IAM role credentials -> combine with the leaked key for full cloud-account takeover")
+    # Open cloud storage + source disclosure -> targeted bucket looting
+    if has_any("Open Cloud Storage") and has_any("Source Code Disclosure", "Backup File Exposed"):
+        job.chain("ATTACK PATH: source reveals exact bucket names -> the public storage bucket is then enumerated and looted precisely")
+    # Missing security headers + XSS -> reliable exploitation (no CSP to stop it)
+    if has_any("Reflected XSS", "Stored XSS", "DOM XSS") and has_any("CSP Weakness", "Missing Header (HIGH)", "Missing Header (MEDIUM)"):
+        job.chain("ATTACK PATH: XSS with a weak/absent CSP -> script executes unhindered -> keylogging, session theft and worm propagation")
+    # Clickjacking + CSRF -> UI-redress driven state change
+    if has_any("Clickjacking") and has_any("CSRF Missing Token"):
+        job.chain("ATTACK PATH: no frame protection + no CSRF token -> clickjack the victim into performing a state-changing action")
+    # Insecure cookie + XSS -> trivially stolen session
+    if has_any("Insecure Cookie") and has_any("Reflected XSS", "Stored XSS", "DOM XSS"):
+        job.chain("ATTACK PATH: session cookie without HttpOnly + XSS -> document.cookie exfiltrates the session directly")
+    # LFI -> log poisoning -> RCE (classic)
+    if has_any("LFI", "LFI Config Read"):
+        job.chain("ATTACK PATH: LFI -> include a poisoned log/session file containing PHP -> escalate file read into remote code execution")
+    # Open redirect -> SSRF filter bypass
+    if has_any("Open Redirect") and has_any("SSRF"):
+        job.chain("ATTACK PATH: open redirect chains through the SSRF filter -> reach internal hosts the allow-list thought were blocked")
+    # Verbose errors + SQLi -> faster blind extraction
+    if has_any("Verbose Error Disclosure") and has_any("SQL Injection", "SQL Injection (Form)"):
+        job.chain("ATTACK PATH: DB errors echoed back -> turn blind SQLi into fast error-based extraction of the whole schema")
+    # Prototype pollution -> gadget -> XSS/RCE
+    if has_any("Proto Pollution"):
+        job.chain("ATTACK PATH: prototype pollution -> poison a shared object property -> reach a gadget for DOM XSS (client) or RCE (Node.js)")
+    # Comment leak seeds targeted attacks
+    if has_any("Information Leak (Comment)") and len(types) > 2:
+        job.chain("ATTACK PATH: leaked developer comments expose internal paths/creds -> attacker targets the exact endpoints the other findings apply to")
+    # Weak TLS + login form -> credential interception
+    if has_any("SSL/TLS Weakness", "Mixed Content") and has_forms:
+        job.chain("ATTACK PATH: weak TLS / mixed content on a page with a login form -> MITM downgrade -> intercept submitted credentials")
+
     added = len(job.chains) - n_before
     if added == 0:
         job.log("Chain analysis: no multi-step chains -- findings are isolated", "INFO")
@@ -3990,7 +4220,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PHANTOM v5.1 — Ultimate Web Scanner</title>
+<title>PHANTOM v5.2 — Ultimate Web Scanner</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#080c10;--bg2:#0d1117;--bg3:#161b22;--bd:#21262d;
@@ -4114,7 +4344,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v5.1</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">RL MUTATOR</span><span class="bdg byr">63 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.2</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">WAF-AWARE RL</span><span class="bdg bc">REAL-BROWSER</span><span class="bdg byr">66 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -4124,12 +4354,12 @@ input[type=text]:focus{border-color:var(--cy)}
 <div id="fa">
   <div class="card">
     <h2>⚡ Launch Ultimate Security Scan</h2>
-    <p>PHANTOM v5.1 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 63 Modules incl. Out-of-Band engine, RL adaptive mutation, race-condition/TOCTOU, client-side template injection, source-map recovery, stateful business-logic & API fuzzing — with keep-alive connection pooling and a parallel site-wide scan for speed, CVSS v3.1 scoring and an attack-chain engine.</p>
+    <p>PHANTOM v5.2 runs autonomous phases: OSINT + Subdomain Enum → Async Port Scan → Deep Spider + Headless DOM → 66 Modules incl. Out-of-Band engine, WAF-aware RL mutation, race-condition/TOCTOU, client-side template injection, JSONP & GraphQL-CSRF, source-map recovery, stateful business-logic & API fuzzing. It browses like a real Chrome session (Client Hints + Fetch Metadata + cookie reuse) to pass passive WAF/Cloudflare checks — with keep-alive pooling and a parallel site-wide scan for speed, CVSS v3.1 scoring and a 40+ path attack-chain engine.</p>
     <div style="margin-bottom:10px">
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
     </div>
-    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.1</button>
+    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.2</button>
     <div id="err-box" style="display:none;margin-top:10px;background:#f8514918;border:1px solid #f8514960;
       border-radius:8px;padding:10px 14px;color:#f85149;font-size:.8rem;font-family:monospace"></div>
     <div class="qt" style="margin-top:10px">
@@ -4206,7 +4436,7 @@ const PH=['Phase 0: OSINT & Recon','Phase 1: Port Scan','Phase 2: Spider & JS','
 function su(u){document.getElementById('iu').value=u;return false}
 function showErr(msg){
   const b=document.getElementById('sb');
-  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.1';
+  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.2';
   document.getElementById('fa').style.display='block';
   document.getElementById('pa').style.display='none';
   const eb=document.getElementById('err-box');
@@ -4432,11 +4662,11 @@ def oob_collect_endpoint(token, rest):
 def health():
     active = sum(1 for s in scans.values() if s.status=="running")
     return jsonify({"status":"ok","version":VER,"active_scans":active,
-                    "modules":63,"pooling":True,
+                    "modules":66,"pooling":True,"human_like":True,
                     "oob_ready":bool(OOB_BASE),"headless":PW_OK,"fast":FAST})
 
 if __name__ == "__main__":
     print(f"[*] PHANTOM v{VER} starting on port {PORT}")
-    print(f"[*] 63 modules | keep-alive pooling | parallel site scan | FAST={FAST}")
+    print(f"[*] 66 modules | real-browser traffic | WAF-aware mutation | pooling | FAST={FAST}")
     print(f"[*] Open: http://localhost:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
