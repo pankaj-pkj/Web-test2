@@ -3,7 +3,7 @@
 PHANTOM v5.2 - ULTIMATE Web Vulnerability Scanner
 Flask Web App | Render.com | 66 Modules | Real-Browser Traffic | WAF-Aware Mutation
 """
-import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,threading,time,uuid,warnings
+import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,sys,threading,time,uuid,warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from functools import partial
@@ -4255,6 +4255,12 @@ input[type=text]:focus{border-color:var(--cy)}
 .btn:hover{opacity:.88}.btn:disabled{opacity:.4;cursor:not-allowed}
 .qt a{color:var(--cy);font-size:.73rem;display:inline-block;margin:3px 5px 3px 0;text-decoration:none}
 .qt a:hover{text-decoration:underline}
+.cli-box{margin-top:12px;background:#010409;border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
+.cli-h{color:var(--gn);font-size:.72rem;font-weight:700;margin-bottom:6px}
+.cli-c{font-family:'Courier New',monospace;font-size:.7rem;color:var(--tx);white-space:pre-wrap;
+  word-break:break-all;line-height:1.5;overflow-x:auto}
+.cli-c .cc{color:var(--cy)}
+.cli-n{color:var(--dm);font-size:.66rem;margin-top:6px}
 #pa{display:none;margin-bottom:12px}
 .pc{background:var(--bg3);border:1px solid var(--bd);border-radius:12px;padding:14px 18px;margin-bottom:10px}
 .ptop{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
@@ -4369,6 +4375,12 @@ input[type=text]:focus{border-color:var(--cy)}
       <a href="#" onclick="su('http://testphp.vulnweb.com/listproducts.php?cat=1')">SQLi test</a>
       <a href="#" onclick="su('http://testphp.vulnweb.com/artists.php?artist=1')">artists.php</a>
     </div>
+    <div class="cli-box">
+      <div class="cli-h">📱 Run in Termux / any terminal (headless → JSON file)</div>
+      <pre class="cli-c"><span class="cc">pkg install python git -y &amp;&amp; pip install -r requirements.txt</span>
+<span class="cc">python phantom.py https://your-authorized-target.com -o report.json</span></pre>
+      <div class="cli-n">Writes a full JSON report — no browser needed. Works even if the web app can't run here.</div>
+    </div>
   </div>
 </div>
 <div id="pa">
@@ -4424,6 +4436,7 @@ input[type=text]:focus{border-color:var(--cy)}
   <div class="vl" id="vl"></div>
   <a href="/" class="bna">← New Scan</a>
   <a href="#" class="dlb" id="dl">⬇ Download JSON Report</a>
+  <a href="#" class="dlb" id="apil" target="_blank" style="background:#388bfd18;border-color:#388bfd50;color:var(--cy)">⧉ Open JSON (API)</a>
 </div>
 </div>
 <script>
@@ -4580,10 +4593,12 @@ function showRes(d){
       c.innerHTML=h;vl.appendChild(c);
     });
   }
-  document.getElementById('dl').onclick=()=>{
-    const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
-    const a=document.createElement('a');a.href=URL.createObjectURL(b);
-    a.download='phantom_v5_'+sid+'.json';a.click();return false;};
+  // Download the clean, structured report straight from the server.
+  const dl=document.getElementById('dl');
+  dl.href='/report/'+sid+'.json';
+  dl.onclick=()=>{window.location.href='/report/'+sid+'.json';return false;};
+  const api=document.getElementById('apil');
+  if(api)api.href='/report/'+sid+'.json';
 }
 function tf(n){var e=document.getElementById('fd'+n);e.style.display=e.style.display==='block'?'none':'block';}
 function tf2(n){var e=document.getElementById('pc'+n);e.style.display=e.style.display==='block'?'none':'block';}
@@ -4591,6 +4606,58 @@ function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 </script>
 </body>
 </html>"""
+
+# ══ REPORT BUILDER ════════════════════════════════════════════════════════════
+def job_report(job):
+    """A single, clean, self-describing JSON report — used by the download
+    endpoint and by the CLI/Termux mode so both give identical output."""
+    with job._lock:
+        vulns  = list(job.vulns)
+        ports  = list(job.ports)
+        chains = [c["msg"] for c in job.chains]
+        subs   = list(job.subdomains)
+        secrets= list(job.secrets)
+        logs   = [f"[{l['ts']}] {l['level']}: {l['msg']}" for l in job.logs]
+    c = job.counts()
+    risk = ("CRITICAL" if c["CRITICAL"] else "HIGH" if c["HIGH"] else
+            "MEDIUM" if c["MEDIUM"] else "LOW" if c["LOW"] else "NONE")
+    return {
+        "scanner":     "PHANTOM",
+        "version":     VER,
+        "target":      job.url,
+        "host":        job.host,
+        "scan_id":     job.id,
+        "generated":   datetime.now().isoformat(timespec="seconds"),
+        "status":      job.status,
+        "elapsed_seconds": round(time.time()-job.start,1) if job.status=="running" else job.elapsed,
+        "summary": {
+            "risk":           risk,
+            "total_findings": len(vulns),
+            "critical":       c["CRITICAL"],
+            "high":           c["HIGH"],
+            "medium":         c["MEDIUM"],
+            "low":            c["LOW"],
+            "urls_tested":    len(job.urls),
+            "open_ports":     len(ports),
+            "subdomains":     len(subs),
+            "secrets":        len(secrets),
+            "attack_chains":  len(chains),
+        },
+        "waf_info":        job.waf_info,
+        "tech_stack":      job.tech_stack,
+        "vulnerabilities": vulns,
+        "attack_chains":   chains,
+        "ports":           ports,
+        "subdomains":      subs,
+        "secrets":         secrets,
+        "csp_analysis":    job.csp_analysis,
+        "ssl_info":        job.ssl_info,
+        "oob_events":      job.oob_events,
+        "api_info":        job.api_info,
+        "rl_strategies":   job.mutator.ranking(),
+        "log":             logs,
+    }
+
 
 # ══ FLASK ROUTES ══════════════════════════════════════════════════════════════
 @app.route("/")
@@ -4643,6 +4710,20 @@ def status(sid):
         "rl_strategies":job.mutator.ranking(),
     })
 
+@app.route("/report/<sid>")
+@app.route("/report/<sid>.json")
+def report(sid):
+    """Clean, structured JSON report as a downloadable file. This is what the
+    'Download JSON Report' button and the CLI/Termux mode both produce."""
+    job = scans.get(sid)
+    if not job:
+        return jsonify({"error": "Not found"}), 404
+    body = json.dumps(job_report(job), indent=2, default=str)
+    fname = f"phantom_{job.host.replace(':','_')}_{sid}.json"
+    return app.response_class(
+        body, mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
 @app.route("/oob/<token>", defaults={"rest": ""})
 @app.route("/oob/<token>/<path:rest>")
 def oob_collect_endpoint(token, rest):
@@ -4665,8 +4746,87 @@ def health():
                     "modules":66,"pooling":True,"human_like":True,
                     "oob_ready":bool(OOB_BASE),"headless":PW_OK,"fast":FAST})
 
+USAGE = f"""PHANTOM v{VER} — web vulnerability scanner
+
+WEB UI (default):
+  python phantom.py                 # then open http://localhost:{PORT}
+
+CLI / TERMUX (headless, writes a JSON report):
+  python phantom.py <url>                     # scan and save phantom_<host>_<id>.json
+  python phantom.py <url> -o report.json      # choose the output file
+  python phantom.py <url> --quiet             # only print the final summary
+  python phantom.py <url> --print             # also echo the JSON to the screen
+
+Only scan systems you own or are explicitly authorized to test.
+"""
+
+def _cli_main(argv):
+    """Headless scan for terminals/Termux: runs the full engine, streams the
+    live log, then writes a clean JSON report file. No browser needed."""
+    if argv[0] in ("-h", "--help", "help"):
+        print(USAGE); return
+    url = None; out = None; quiet = False; echo = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-o", "--out"):
+            i += 1; out = argv[i] if i < len(argv) else None
+        elif a == "--quiet":
+            quiet = True
+        elif a == "--print":
+            echo = True
+        elif not a.startswith("-") and url is None:
+            url = a
+        i += 1
+    if not url:
+        print(USAGE); sys.exit(1)
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    job = ScanJob(url)
+    scans[job.id] = job
+    print(f"[*] PHANTOM v{VER} — target: {url}")
+    print(f"[*] {'FAST' if FAST else 'FULL'} mode | 66 modules | budget {SCAN_BUDGET}s | id {job.id}\n")
+
+    t = threading.Thread(target=run_scan, args=(job,), daemon=True)
+    t.start()
+    seen = 0
+    while t.is_alive() or seen < len(job.logs):
+        with job._lock:
+            new = list(job.logs)[seen:]
+        seen += len(new)
+        if not quiet:
+            for l in new:
+                print(f"  [{l['ts']}] {l['level']:<5} {l['msg']}")
+        time.sleep(0.3)
+    t.join()
+
+    report = job_report(job)
+    out = out or f"phantom_{job.host.replace(':','_')}_{int(time.time())}.json"
+    try:
+        with open(out, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[!] Could not write {out}: {e}"); out = None
+
+    s = report["summary"]
+    print(f"\n[✓] Done in {job.elapsed}s — {s['total_findings']} findings "
+          f"(C:{s['critical']} H:{s['high']} M:{s['medium']} L:{s['low']}) | risk {s['risk']}")
+    if s["attack_chains"]:
+        print(f"[✓] {s['attack_chains']} attack chain(s) correlated")
+    if out:
+        print(f"[✓] JSON report written: {out}")
+    if echo:
+        print("\n" + json.dumps(report, indent=2, default=str))
+
+
 if __name__ == "__main__":
-    print(f"[*] PHANTOM v{VER} starting on port {PORT}")
-    print(f"[*] 66 modules | real-browser traffic | WAF-aware mutation | pooling | FAST={FAST}")
-    print(f"[*] Open: http://localhost:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    _args = sys.argv[1:]
+    # A target argument switches to headless CLI/Termux mode; otherwise serve web.
+    if _args and _args[0] not in ("serve", "web", "runserver"):
+        _cli_main(_args)
+    else:
+        print(f"[*] PHANTOM v{VER} starting on port {PORT}")
+        print(f"[*] 66 modules | real-browser traffic | WAF-aware mutation | pooling | FAST={FAST}")
+        print(f"[*] Web UI: http://localhost:{PORT}   |   CLI: python phantom.py <url>")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

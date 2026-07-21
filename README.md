@@ -127,9 +127,39 @@ systems you own or are permitted to test.
 > Educational / authorized-testing tool. Only scan systems you own or have
 > explicit permission to test.
 
-## Run locally
+## Run locally (web UI)
 ```bash
 pip install -r requirements.txt
 python phantom.py
 # open http://localhost:5000
 ```
+
+## Run in Termux / any terminal (headless → JSON file)
+No browser needed — the scanner runs the full engine from the command line and
+writes a structured JSON report. Ideal for Android (Termux) or when the web app
+can't run in your environment.
+
+```bash
+# one-time setup in Termux
+pkg install python git -y
+git clone <this-repo> && cd Web-test2
+pip install -r requirements.txt
+
+# scan and save a JSON report
+python phantom.py https://your-authorized-target.com
+python phantom.py https://target.com -o report.json   # choose the output file
+python phantom.py https://target.com --quiet           # only the final summary
+python phantom.py https://target.com --print           # also echo the JSON
+python phantom.py --help                                # usage
+```
+The report file (`phantom_<host>_<id>.json`) contains a `summary` (risk + counts),
+every `vulnerabilities` entry (with CVSS score/vector, evidence, the exact
+vulnerable `code` snippet, remediation `fix` and a reproduction `poc`), the
+correlated `attack_chains`, discovered ports/subdomains/secrets and the run log.
+
+## Get the JSON from the web app
+Every scan also exposes its report as a downloadable file straight from the server:
+- **In the UI**: the results page has **⬇ Download JSON Report** and **⧉ Open JSON (API)** buttons.
+- **Direct URL**: `GET /report/<scan_id>.json` returns the same structured report
+  (`Content-Disposition: attachment`). `POST /scan` (form field `url`) starts a
+  scan and returns `{"scan_id": ...}`; poll `GET /api/status/<scan_id>` for progress.
