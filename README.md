@@ -1,4 +1,4 @@
-# PHANTOM v5.2 — Web Vulnerability Scanner
+# PHANTOM v5.3 — Web Vulnerability Scanner
 
 ● Live Scanning Web Interface (Render Deployment): https://web-testing-ybe5.onrender.com/
 
@@ -157,9 +157,17 @@ every `vulnerabilities` entry (with CVSS score/vector, evidence, the exact
 vulnerable `code` snippet, remediation `fix` and a reproduction `poc`), the
 correlated `attack_chains`, discovered ports/subdomains/secrets and the run log.
 
-## Get the JSON from the web app
-Every scan also exposes its report as a downloadable file straight from the server:
-- **In the UI**: the results page has **⬇ Download JSON Report** and **⧉ Open JSON (API)** buttons.
-- **Direct URL**: `GET /report/<scan_id>.json` returns the same structured report
-  (`Content-Disposition: attachment`). `POST /scan` (form field `url`) starts a
-  scan and returns `{"scan_id": ...}`; poll `GET /api/status/<scan_id>` for progress.
+## Reports (JSON + professional HTML)
+Every scan produces both a machine-readable JSON report and a polished,
+self-contained **HTML report** (executive summary, risk rating, severity chart,
+**OWASP Top 10 (2021)** breakdown, and per-finding **CWE + OWASP + CVSS**,
+vulnerable-code snippet, remediation and PoC). The HTML is standalone — open it
+in any browser and **Ctrl-P → Save as PDF** for a submission-ready document.
+
+- **In the UI**: the results page has **📄 HTML Report**, **⬇ Download JSON Report**
+  and **⧉ Open JSON (API)** buttons.
+- **Direct URLs**: `GET /report/<scan_id>.html` (viewable report) and
+  `GET /report/<scan_id>.json` (structured download). `POST /scan` (form field
+  `url`) starts a scan and returns `{"scan_id": ...}`; poll
+  `GET /api/status/<scan_id>` for progress.
+- **CLI**: add `--html` to also write the HTML report next to the JSON file.

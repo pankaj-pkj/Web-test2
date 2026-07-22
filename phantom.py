@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PHANTOM v5.2 - ULTIMATE Web Vulnerability Scanner
+PHANTOM v5.3 - ULTIMATE Web Vulnerability Scanner
 Flask Web App | Render.com | 66 Modules | Real-Browser Traffic | WAF-Aware Mutation
 """
 import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,sys,threading,time,uuid,warnings
@@ -27,7 +27,7 @@ except: PW_OK=False
 PORT=int(os.environ.get("PORT",5000))
 THREADS=int(os.environ.get("PHANTOM_THREADS",24)); TIMEOUT=int(os.environ.get("PHANTOM_TIMEOUT",7))
 DEPTH=int(os.environ.get("PHANTOM_DEPTH",3)); MAXURLS=150
-DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.2"
+DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.3"
 FAST=os.environ.get("PHANTOM_FAST","1")!="0"          # speed-first mode (default on)
 SCAN_BUDGET=int(os.environ.get("PHANTOM_BUDGET","300"))# hard time budget (seconds)
 MAX_PARAM=6 if FAST else 12                            # params tested per URL
@@ -844,6 +844,73 @@ VULN_FIX={
     "Information Leak (Comment)":["Strip HTML/JS comments from production builds","Never leave credentials or internal paths in markup","Add a build step that removes developer comments"],
 }
 
+# ══ OWASP TOP 10 (2021) + CWE TAXONOMY ═══════════════════════════════════════
+# Maps every finding to its industry CWE id and OWASP Top-10 category so reports
+# speak the language auditors and evaluators expect.
+OWASP = {
+    "A01": "A01:2021 Broken Access Control",
+    "A02": "A02:2021 Cryptographic Failures",
+    "A03": "A03:2021 Injection",
+    "A04": "A04:2021 Insecure Design",
+    "A05": "A05:2021 Security Misconfiguration",
+    "A06": "A06:2021 Vulnerable & Outdated Components",
+    "A07": "A07:2021 Identification & Authentication Failures",
+    "A08": "A08:2021 Software & Data Integrity Failures",
+    "A09": "A09:2021 Security Logging & Monitoring Failures",
+    "A10": "A10:2021 Server-Side Request Forgery",
+}
+VULN_TAXONOMY = {
+    "SQL Injection":("CWE-89","A03"), "SQL Injection (Form)":("CWE-89","A03"),
+    "NoSQL Injection":("CWE-943","A03"), "Command Injection":("CWE-78","A03"),
+    "LFI":("CWE-98","A03"), "LFI Config Read":("CWE-98","A03"),
+    "SSRF":("CWE-918","A10"), "Blind SSRF (OOB)":("CWE-918","A10"),
+    "XXE Injection":("CWE-611","A05"), "Blind XXE (OOB)":("CWE-611","A05"),
+    "SSTI":("CWE-1336","A03"), "Expression Language Injection":("CWE-917","A03"),
+    "XPath Injection":("CWE-643","A03"), "LDAP Injection":("CWE-90","A03"),
+    "CRLF Injection":("CWE-93","A03"), "HTTP Parameter Pollution":("CWE-235","A03"),
+    "Proto Pollution":("CWE-1321","A03"), "Log4Shell (JNDI)":("CWE-502","A06"),
+    "Out-of-Band RCE":("CWE-77","A03"),
+    "Reflected XSS":("CWE-79","A03"), "Reflected XSS (Form)":("CWE-79","A03"),
+    "Stored XSS":("CWE-79","A03"), "DOM XSS":("CWE-79","A03"),
+    "Client-Side Template Injection":("CWE-79","A03"),
+    "Clickjacking":("CWE-1021","A05"), "CSRF Missing Token":("CWE-352","A01"),
+    "GraphQL CSRF":("CWE-352","A01"), "Reverse Tabnabbing":("CWE-1022","A05"),
+    "Mixed Content":("CWE-311","A02"),
+    "IDOR":("CWE-639","A01"), "Forced Browsing":("CWE-425","A01"),
+    "OAuth Misconfiguration":("CWE-346","A07"), "Open Redirect":("CWE-601","A01"),
+    "User Enumeration":("CWE-204","A07"), "Weak JWT Secret":("CWE-347","A02"),
+    "Insecure Cookie":("CWE-614","A05"), "Session Fixation":("CWE-384","A07"),
+    "Default Credentials":("CWE-1392","A07"),
+    "Sensitive File Exposed":("CWE-538","A05"), "Backup File Exposed":("CWE-530","A05"),
+    "Source Code Disclosure":("CWE-540","A05"), "Directory Listing":("CWE-548","A05"),
+    "Verbose Error Disclosure":("CWE-209","A05"), "Stack Trace Leaked":("CWE-209","A05"),
+    "API Key Exposed":("CWE-798","A05"), "Hidden Parameter":("CWE-799","A05"),
+    "Information Leak (Comment)":("CWE-615","A05"), "JSONP Endpoint":("CWE-942","A05"),
+    "Subdomain Takeover":("CWE-350","A05"), "Open Cloud Storage":("CWE-264","A05"),
+    "Email Spoofing (SPF/DMARC)":("CWE-290","A07"),
+    "Insecure Deserialization":("CWE-502","A08"), "Unrestricted File Upload":("CWE-434","A05"),
+    "Host Header Injection":("CWE-644","A05"), "Web Cache Poisoning":("CWE-524","A05"),
+    "Web Cache Deception":("CWE-525","A05"), "Dangerous HTTP Method":("CWE-650","A05"),
+    "Cross-Site Tracing (XST)":("CWE-693","A05"), "HTTP Request Smuggling":("CWE-444","A05"),
+    "Rate Limiting Missing":("CWE-307","A04"), "Race Condition":("CWE-362","A04"),
+    "GraphQL Introspection":("CWE-200","A05"), "GraphQL DoS":("CWE-770","A04"),
+    "WebSocket Vulnerability":("CWE-1385","A05"), "CSP Weakness":("CWE-1021","A05"),
+    "CORS Misconfiguration":("CWE-942","A05"), "SSL/TLS Weakness":("CWE-326","A02"),
+    "Missing Header (HIGH)":("CWE-693","A05"), "Missing Header (MEDIUM)":("CWE-693","A05"),
+    "Missing Header (LOW)":("CWE-693","A05"), "Missing security.txt":("CWE-1059","A05"),
+    "Outdated Service CVE":("CWE-1035","A06"), "WordPress Vulnerability":("CWE-1035","A06"),
+    "Mass Assignment":("CWE-915","A08"), "Excessive Data Exposure":("CWE-213","A01"),
+    "API Misconfiguration":("CWE-16","A05"), "HTTP Method Override":("CWE-650","A05"),
+    "Stateful Logic Flaw":("CWE-840","A04"), "Business Logic Flaw":("CWE-840","A04"),
+    "Vulnerable Code Pattern":("CWE-1104","A08"), "Dangerous Binary Pattern":("CWE-1104","A08"),
+    "Unauthenticated Redis":("CWE-306","A05"), "Unauthenticated MongoDB":("CWE-306","A05"),
+    "Unauthenticated Elasticsearch":("CWE-306","A05"), "FTP Anonymous Login":("CWE-306","A05"),
+}
+def taxonomy(vtype):
+    """Return (cwe, owasp_category_label) for a finding type, with a safe default."""
+    cwe, cat = VULN_TAXONOMY.get(vtype, ("CWE-noinfo", "A05"))
+    return cwe, OWASP.get(cat, OWASP["A05"])
+
 
 # ══ SCAN JOB ══════════════════════════════════════════════════════════════════
 class ScanJob:
@@ -903,6 +970,7 @@ class ScanJob:
         cvss_score, cvss_vec, cvss_sev = CVSS.score(vtype)
         impact = VULN_IMPACT.get(vtype, "Security issue detected")
         fix    = VULN_FIX.get(vtype, ["Review and remediate this vulnerability"])
+        cwe, owasp = taxonomy(vtype)
         with self._lock:
             self._vcnt += 1
             det = evidence[:120]
@@ -922,6 +990,8 @@ class ScanJob:
                 "impact":      impact,
                 "fix":         fix,
                 "chain_type":  chain_type,
+                "cwe":         cwe,
+                "owasp":       owasp,
                 "code":        code[:600],   # the exact vulnerable snippet ("kaha issue hai")
                 "poc":         "",           # filled by the PoC generator
             })
@@ -4235,7 +4305,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PHANTOM v5.2 — Ultimate Web Scanner</title>
+<title>PHANTOM v5.3 — Ultimate Web Scanner</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#080c10;--bg2:#0d1117;--bg3:#161b22;--bd:#21262d;
@@ -4365,7 +4435,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v5.2</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">WAF-AWARE RL</span><span class="bdg bc">REAL-BROWSER</span><span class="bdg byr">66 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.3</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">WAF-AWARE RL</span><span class="bdg bc">REAL-BROWSER</span><span class="bdg byr">66 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -4380,7 +4450,7 @@ input[type=text]:focus{border-color:var(--cy)}
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
     </div>
-    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.2</button>
+    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.3</button>
     <div id="err-box" style="display:none;margin-top:10px;background:#f8514918;border:1px solid #f8514960;
       border-radius:8px;padding:10px 14px;color:#f85149;font-size:.8rem;font-family:monospace"></div>
     <div class="qt" style="margin-top:10px">
@@ -4450,6 +4520,7 @@ input[type=text]:focus{border-color:var(--cy)}
   </div>
   <div class="vl" id="vl"></div>
   <a href="/" class="bna">← New Scan</a>
+  <a href="#" class="dlb" id="htmlr" target="_blank" style="background:#bc8cff18;border-color:#bc8cff50;color:var(--mg)">📄 HTML Report</a>
   <a href="#" class="dlb" id="dl">⬇ Download JSON Report</a>
   <a href="#" class="dlb" id="apil" target="_blank" style="background:#388bfd18;border-color:#388bfd50;color:var(--cy)">⧉ Open JSON (API)</a>
 </div>
@@ -4464,7 +4535,7 @@ const PH=['Phase 0: OSINT & Recon','Phase 1: Port Scan','Phase 2: Spider & JS','
 function su(u){document.getElementById('iu').value=u;return false}
 function showErr(msg){
   const b=document.getElementById('sb');
-  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.2';
+  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.3';
   document.getElementById('fa').style.display='block';
   document.getElementById('pa').style.display='none';
   const eb=document.getElementById('err-box');
@@ -4614,6 +4685,8 @@ function showRes(d){
   dl.onclick=()=>{window.location.href='/report/'+sid+'.json';return false;};
   const api=document.getElementById('apil');
   if(api)api.href='/report/'+sid+'.json';
+  const hr=document.getElementById('htmlr');
+  if(hr)hr.href='/report/'+sid+'.html';
 }
 function tf(n){var e=document.getElementById('fd'+n);e.style.display=e.style.display==='block'?'none':'block';}
 function tf2(n){var e=document.getElementById('pc'+n);e.style.display=e.style.display==='block'?'none':'block';}
@@ -4672,6 +4745,168 @@ def job_report(job):
         "rl_strategies":   job.mutator.ranking(),
         "log":             logs,
     }
+
+
+# ══ PROFESSIONAL HTML REPORT ═════════════════════════════════════════════════
+_REPORT_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,Arial,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.5;padding:0 0 40px}
+.wrap{max-width:960px;margin:0 auto;padding:0 18px}
+.top{background:linear-gradient(135deg,#161b22,#0d1117);border-bottom:2px solid #f8514940;padding:26px 0;margin-bottom:22px}
+.top h1{font-size:1.5rem;color:#f85149;letter-spacing:.04em}
+.top .sub{color:#8b949e;font-size:.82rem;margin-top:6px}
+.top .meta{color:#8b949e;font-size:.76rem;margin-top:10px;display:flex;flex-wrap:wrap;gap:16px}
+.top .meta b{color:#e6edf3;font-weight:600}
+h2{font-size:1rem;margin:26px 0 12px;color:#e6edf3;border-left:3px solid #58a6ff;padding-left:10px}
+.exec{display:grid;grid-template-columns:180px 1fr;gap:18px;background:#161b22;border:1px solid #21262d;border-radius:12px;padding:20px}
+@media(max-width:640px){.exec{grid-template-columns:1fr}}
+.risk{text-align:center;border-radius:10px;padding:18px 10px;display:flex;flex-direction:column;justify-content:center}
+.risk .rl{font-size:.68rem;color:#8b949e;letter-spacing:.1em}
+.risk .rv{font-size:1.7rem;font-weight:800;margin-top:4px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
+.cc{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:10px;text-align:center}
+.cc .n{font-size:1.4rem;font-weight:800}.cc .l{font-size:.62rem;color:#8b949e;letter-spacing:.06em}
+.bar{display:flex;height:14px;border-radius:7px;overflow:hidden;background:#21262d;margin-bottom:6px}
+.bar div{height:100%}
+.legend{font-size:.7rem;color:#8b949e;display:flex;gap:14px;flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.ob{display:grid;grid-template-columns:220px 1fr 34px;align-items:center;gap:10px;margin-bottom:6px;font-size:.74rem}
+@media(max-width:640px){.ob{grid-template-columns:150px 1fr 30px}}
+.obl{color:#8b949e}.obt{background:#21262d;border-radius:6px;height:9px;overflow:hidden}
+.obf{background:linear-gradient(90deg,#58a6ff,#bc8cff);height:100%}
+.obn{text-align:right;color:#e6edf3;font-weight:600}
+.finding{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:16px;margin-bottom:12px}
+.fh{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sev{font-size:.66rem;font-weight:800;padding:2px 8px;border-radius:4px;letter-spacing:.05em}
+.ft{font-size:.96rem;font-weight:700;color:#e6edf3}
+.cvss{margin-left:auto;font-size:.72rem;color:#8b949e;font-weight:600}
+.meta{font-size:.7rem;color:#bc8cff;margin:6px 0 2px;font-weight:600}
+.loc{font-family:'Courier New',monospace;font-size:.74rem;color:#58a6ff;word-break:break-all;margin-bottom:6px}
+.ev{font-size:.8rem;color:#c9d1d9;margin-bottom:8px}
+.lbl{font-size:.66rem;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin:8px 0 4px}
+.code{background:#010409;border:1px solid #21262d;border-radius:6px;padding:8px 10px;font-family:'Courier New',monospace;
+  font-size:.7rem;color:#e6edf3;white-space:pre-wrap;word-break:break-all;overflow-x:auto}
+.fix{margin:2px 0 8px 18px;font-size:.76rem;color:#c9d1d9}.fix li{margin-bottom:2px}
+.imp{font-size:.72rem;color:#d29922;background:#d2992212;border-radius:6px;padding:6px 10px;margin-top:6px}
+.chain{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px}
+.chain li{font-size:.78rem;color:#bc8cff;margin-bottom:6px;list-style:none;padding-left:16px;position:relative}
+.chain li:before{content:'⛓';position:absolute;left:-2px}
+.recon{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:640px){.recon{grid-template-columns:1fr}}
+.rc{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px}
+.rc h3{font-size:.8rem;margin-bottom:8px;color:#58a6ff}
+.tag{display:inline-block;background:#3fb95018;border:1px solid #3fb95035;color:#3fb950;padding:2px 8px;border-radius:4px;font-size:.7rem;margin:2px}
+.kv{font-size:.76rem;color:#c9d1d9;margin-bottom:3px}.kv b{color:#8b949e;font-weight:600}
+.foot{margin-top:30px;padding-top:16px;border-top:1px solid #21262d;color:#8b949e;font-size:.72rem;text-align:center}
+.empty{color:#3fb950;font-size:.9rem;padding:20px;text-align:center;background:#161b22;border:1px solid #21262d;border-radius:10px}
+"""
+
+def render_html_report(rep):
+    """Render a standalone, self-contained professional HTML report (inline CSS,
+    inline SVG-free bar charts) from a job_report() dict — for evaluators, PDFs
+    (Ctrl-P) and sharing. No external assets, works offline."""
+    import html as _html
+    def esc(x): return _html.escape(str(x if x is not None else ""))
+    s = rep["summary"]
+    SC = {"CRITICAL":"#f85149","HIGH":"#d29922","MEDIUM":"#58a6ff","LOW":"#3fb950","NONE":"#3fb950"}
+    riskc = SC.get(s["risk"], "#3fb950")
+    total = max(s["total_findings"], 1)
+
+    seg = ""
+    leg = ""
+    for k, lbl, col in [("critical","Critical","#f85149"),("high","High","#d29922"),
+                        ("medium","Medium","#58a6ff"),("low","Low","#3fb950")]:
+        if s[k]:
+            seg += f'<div style="width:{s[k]/total*100:.1f}%;background:{col}"></div>'
+            leg += f'<span><i style="background:{col}"></i>{lbl} {s[k]}</span>'
+    if not seg:
+        seg = '<div style="width:100%;background:#3fb950"></div>'
+
+    owc = {}
+    for v in rep["vulnerabilities"]:
+        owc[v.get("owasp","")] = owc.get(v.get("owasp",""), 0) + 1
+    owrows = ""
+    for cat, n in sorted(owc.items(), key=lambda x: -x[1]):
+        if not cat: continue
+        owrows += (f'<div class="ob"><div class="obl">{esc(cat)}</div>'
+                   f'<div class="obt"><div class="obf" style="width:{n/total*100:.0f}%"></div></div>'
+                   f'<div class="obn">{n}</div></div>')
+
+    order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}
+    vulns = sorted(rep["vulnerabilities"], key=lambda v: order.get(v["severity"], 4))
+    cards = ""
+    for v in vulns:
+        c = SC.get(v["severity"], "#8b949e")
+        code = (f'<div class="lbl">Vulnerable code (where the issue is)</div>'
+                f'<pre class="code">{esc(v["code"])}</pre>') if v.get("code") else ""
+        poc = (f'<div class="lbl">Proof of Concept (reproduce)</div>'
+               f'<pre class="code">{esc(v["poc"])}</pre>') if v.get("poc") else ""
+        fixes = "".join(f"<li>{esc(x)}</li>" for x in v.get("fix", []))
+        prm = f' · param: {esc(v["parameter"])}' if v.get("parameter") else ""
+        cards += (f'<div class="finding" style="border-left:3px solid {c}">'
+                  f'<div class="fh"><span class="sev" style="background:{c}22;color:{c};border:1px solid {c}55">{esc(v["severity"])}</span>'
+                  f'<span class="ft">{esc(v["type"])}</span>'
+                  f'<span class="cvss">CVSS {esc(v["cvss"])} · {esc(v.get("cvss_vector",""))}</span></div>'
+                  f'<div class="meta">{esc(v.get("cwe",""))} &nbsp;·&nbsp; {esc(v.get("owasp",""))}</div>'
+                  f'<div class="loc">{esc(v["location"])}{prm}</div>'
+                  f'<div class="ev">{esc(v["evidence"])}</div>'
+                  f'{code}{poc}'
+                  f'<div class="lbl">Remediation</div><ol class="fix">{fixes}</ol>'
+                  f'<div class="imp">Impact: {esc(v.get("impact",""))}</div></div>')
+    if not cards:
+        cards = '<div class="empty">✓ No vulnerabilities were confirmed in this scan.</div>'
+
+    chains = "".join(f"<li>{esc(c)}</li>" for c in rep.get("attack_chains", []))
+    chain_block = f'<h2>Attack Chains</h2><ul class="chain">{chains}</ul>' if chains else ""
+
+    tech = "".join(f'<span class="tag">{esc(t)}</span>' for t in rep.get("tech_stack", [])) or '<span class="kv">—</span>'
+    ports = "".join(f'<div class="kv"><b>{esc(p.get("port"))}</b> {esc(p.get("service",""))} {esc(p.get("version","") or "")}</div>'
+                    for p in rep.get("ports", [])) or '<div class="kv">None open</div>'
+    subs = rep.get("subdomains", [])
+    sub_html = "".join(f'<div class="kv">{esc(sd.get("subdomain", sd) if isinstance(sd,dict) else sd)}</div>' for sd in subs[:12]) or '<div class="kv">None found</div>'
+    waf = rep.get("waf_info", {}) or {}
+    waf_html = (f'<div class="kv"><b>WAF</b> {esc(waf.get("waf"))} ({esc(waf.get("confidence"))}%)</div>'
+                f'<div class="kv"><b>Bypass hint</b> {esc(waf.get("bypass_hint",""))}</div>') if waf.get("waf") else '<div class="kv">No WAF detected</div>'
+
+    head = (f'<div class="top"><div class="wrap"><h1>PHANTOM — Security Assessment Report</h1>'
+            f'<div class="sub">{esc(rep["target"])}</div>'
+            f'<div class="meta"><span><b>Scan ID</b> {esc(rep["scan_id"])}</span>'
+            f'<span><b>Generated</b> {esc(rep["generated"])}</span>'
+            f'<span><b>Duration</b> {esc(rep["elapsed_seconds"])}s</span>'
+            f'<span><b>Scanner</b> PHANTOM v{esc(rep["version"])}</span></div></div></div>')
+
+    exec_block = (f'<div class="exec">'
+                  f'<div class="risk" style="background:{riskc}18;border:1px solid {riskc}55">'
+                  f'<div class="rl">OVERALL RISK</div><div class="rv" style="color:{riskc}">{esc(s["risk"])}</div></div>'
+                  f'<div><div class="cards">'
+                  f'<div class="cc"><div class="n" style="color:#f85149">{s["critical"]}</div><div class="l">CRITICAL</div></div>'
+                  f'<div class="cc"><div class="n" style="color:#d29922">{s["high"]}</div><div class="l">HIGH</div></div>'
+                  f'<div class="cc"><div class="n" style="color:#58a6ff">{s["medium"]}</div><div class="l">MEDIUM</div></div>'
+                  f'<div class="cc"><div class="n" style="color:#3fb950">{s["low"]}</div><div class="l">LOW</div></div>'
+                  f'</div><div class="bar">{seg}</div><div class="legend">{leg}</div>'
+                  f'<div class="kv" style="margin-top:10px">{s["total_findings"]} findings · '
+                  f'{s["urls_tested"]} URLs tested · {s["open_ports"]} open ports · '
+                  f'{s["subdomains"]} subdomains · {s["attack_chains"]} attack chains</div></div></div>')
+
+    owasp_block = f'<h2>OWASP Top 10 (2021) Breakdown</h2>{owrows}' if owrows else ""
+
+    recon_block = (f'<h2>Reconnaissance</h2><div class="recon">'
+                   f'<div class="rc"><h3>🛡 WAF</h3>{waf_html}</div>'
+                   f'<div class="rc"><h3>🔧 Tech Stack</h3>{tech}</div>'
+                   f'<div class="rc"><h3>🔌 Open Ports</h3>{ports}</div>'
+                   f'<div class="rc"><h3>🌐 Subdomains</h3>{sub_html}</div></div>')
+
+    body = (f'<div class="wrap">{exec_block}{owasp_block}'
+            f'<h2>Findings ({s["total_findings"]})</h2>{cards}'
+            f'{chain_block}{recon_block}'
+            f'<div class="foot">Generated by PHANTOM v{esc(rep["version"])} · '
+            f'Educational / authorized-testing tool — only scan systems you own or are permitted to test.</div></div>')
+
+    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>PHANTOM Report — {esc(rep["host"])}</title>'
+            f'<style>{_REPORT_CSS}</style></head><body>{head}{body}</body></html>')
 
 
 # ══ FLASK ROUTES ══════════════════════════════════════════════════════════════
@@ -4739,6 +4974,14 @@ def report(sid):
         body, mimetype="application/json",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
+@app.route("/report/<sid>.html")
+def report_html(sid):
+    """Professional, self-contained HTML report — view in the browser or Ctrl-P to PDF."""
+    job = scans.get(sid)
+    if not job:
+        return "Not found", 404
+    return render_html_report(job_report(job))
+
 @app.route("/oob/<token>", defaults={"rest": ""})
 @app.route("/oob/<token>/<path:rest>")
 def oob_collect_endpoint(token, rest):
@@ -4769,6 +5012,7 @@ WEB UI (default):
 CLI / TERMUX (headless, writes a JSON report):
   python phantom.py <url>                     # scan and save phantom_<host>_<id>.json
   python phantom.py <url> -o report.json      # choose the output file
+  python phantom.py <url> --html              # also write a professional HTML report
   python phantom.py <url> --quiet             # only print the final summary
   python phantom.py <url> --print             # also echo the JSON to the screen
 
@@ -4780,7 +5024,7 @@ def _cli_main(argv):
     live log, then writes a clean JSON report file. No browser needed."""
     if argv[0] in ("-h", "--help", "help"):
         print(USAGE); return
-    url = None; out = None; quiet = False; echo = False
+    url = None; out = None; quiet = False; echo = False; want_html = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -4790,6 +5034,8 @@ def _cli_main(argv):
             quiet = True
         elif a == "--print":
             echo = True
+        elif a == "--html":
+            want_html = True
         elif not a.startswith("-") and url is None:
             url = a
         i += 1
@@ -4824,6 +5070,15 @@ def _cli_main(argv):
     except Exception as e:
         print(f"[!] Could not write {out}: {e}"); out = None
 
+    html_out = None
+    if want_html:
+        html_out = (out[:-5] if out and out.endswith(".json") else out or "phantom_report") + ".html"
+        try:
+            with open(html_out, "w") as f:
+                f.write(render_html_report(report))
+        except Exception as e:
+            print(f"[!] Could not write {html_out}: {e}"); html_out = None
+
     s = report["summary"]
     print(f"\n[✓] Done in {job.elapsed}s — {s['total_findings']} findings "
           f"(C:{s['critical']} H:{s['high']} M:{s['medium']} L:{s['low']}) | risk {s['risk']}")
@@ -4831,6 +5086,8 @@ def _cli_main(argv):
         print(f"[✓] {s['attack_chains']} attack chain(s) correlated")
     if out:
         print(f"[✓] JSON report written: {out}")
+    if html_out:
+        print(f"[✓] HTML report written: {html_out}")
     if echo:
         print("\n" + json.dumps(report, indent=2, default=str))
 
