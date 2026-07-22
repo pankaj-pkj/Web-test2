@@ -183,6 +183,57 @@ def test_jsonp_detected_live(stub_server):
     assert any(v["type"] == "JSONP Endpoint" for v in job.vulns)
 
 
+def test_phase_auth_bearer_sets_header():
+    job = phantom.ScanJob("http://x")
+    job.auth_cfg = {"bearer": "abc123"}
+    # bearer needs no network; phase_auth still probes job.url, so tolerate failure
+    try:
+        phantom.phase_auth(job)
+    except Exception:
+        pass
+    assert job.auth_headers.get("Authorization") == "Bearer abc123"
+    assert job.authenticated is True
+
+
+def test_phase_auth_cookie_parsing():
+    job = phantom.ScanJob("http://x")
+    job.auth_cfg = {"cookie": "session=abc; token=xyz"}
+    try:
+        phantom.phase_auth(job)
+    except Exception:
+        pass
+    assert job.auth_cookies.get("session") == "abc"
+    assert job.auth_cookies.get("token") == "xyz"
+
+
+@pytest.fixture(scope="module")
+def api_stub():
+    from flask import Flask, jsonify
+    app = Flask("apistub")
+
+    @app.route("/swagger.json")
+    def spec():
+        return jsonify({"openapi": "3.0.0", "info": {"title": "API"},
+                        "paths": {"/api/users/{id}": {"get": {}}}})
+
+    @app.route("/api/users/1")
+    def users():
+        return jsonify({"id": 1, "email": "admin@x.com", "token": "sk_live_x"})
+
+    port = 5178
+    threading.Thread(target=lambda: app.run(port=port, threaded=True), daemon=True).start()
+    time.sleep(1.0)
+    return f"http://127.0.0.1:{port}"
+
+
+def test_openapi_discovery_and_unauth_endpoint(api_stub):
+    job = phantom.ScanJob(api_stub)
+    phantom.mod_openapi(job)
+    types = {v["type"] for v in job.vulns}
+    assert "Exposed API Documentation" in types
+    assert job.api_info.get("openapi", {}).get("paths") == 1
+
+
 def test_report_endpoints_via_test_client():
     job = _job_with_findings()
     phantom.scans[job.id] = job

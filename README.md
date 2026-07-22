@@ -1,4 +1,4 @@
-# PHANTOM v5.3 — Web Vulnerability Scanner
+# PHANTOM v5.4 — Web Vulnerability Scanner
 
 ![CI](https://github.com/pankaj-pkj/web-test2/actions/workflows/ci.yml/badge.svg)
 
@@ -6,18 +6,29 @@
 
 An autonomous, single-file web application security scanner with a live Flask UI.
 It runs autonomous phases — **OSINT/Recon → Port Scan → Spider + Headless DOM →
-71 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
+72 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
 **false-positive verification** pass, and correlates issues into **multi-step attack
 chains**. **No paid API or LLM required — pure Python.**
+
+## What's new in v5.4
+- **Authenticated scanning** — log in and test protected areas. Supports a raw
+  **Cookie** header, a **Bearer** token, or **form login** (the scanner submits
+  the credentials, captures the session, and carries it on every request). In the
+  UI (a "🔐 Authenticated scan" panel) and the CLI (`--cookie` / `--bearer` /
+  `--login-url` + `--login-data`).
+- **API / Swagger testing** — auto-discovers an exposed **OpenAPI/Swagger** spec,
+  records the full API surface, and probes endpoints for missing authentication
+  (broken access control). **72 modules** total.
 
 ## What's new in v5.3
 - **Professional HTML report** — executive summary, risk rating, severity chart,
   **OWASP Top 10 (2021)** breakdown and per-finding **CWE + OWASP + CVSS** with the
   vulnerable-code snippet, remediation and PoC. Self-contained → Ctrl-P for a PDF.
   Buttons in the UI, `GET /report/<id>.html`, and `--html` in the CLI.
+- **pytest suite + GitHub Actions CI** across Python 3.10–3.12.
 - **5 modern modules**: vulnerable-JS-library detection, missing **SRI**,
   **AI/LLM prompt-injection** probe, insecure **postMessage**, and deep **JWT**
-  analysis — bringing the total to **71**.
+  analysis.
 
 ## What's new in v5.2
 - **Real-browser traffic** — every request now sends a coherent Chrome/Firefox/Safari
@@ -45,7 +56,7 @@ chains**. **No paid API or LLM required — pure Python.**
   Injection** (AngularJS/Vue), and **Source-Map Recovery**.
 
 ## Highlights
-- **71 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
+- **72 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
 - **Out-of-Band (OOB) engine** — the scanner's own public URL is the interaction
   listener, so blind SSRF / RCE / XXE are *confirmed* via real call-backs (no
   third-party collaborator service needed)
@@ -88,7 +99,7 @@ contains the issue — so you can see *what* is wrong and *where* to fix it.
 | `PHANTOM_BUDGET` | `300` | Hard per-scan time budget (seconds) |
 | `PHANTOM_THREADS` | `24` | Concurrent workers |
 
-## Detection coverage (71 modules)
+## Detection coverage (72 modules)
 
 **Injection:** SQL Injection (error/boolean/time/UNION), SQLi via forms, NoSQL
 Injection, Command Injection, LFI / `php://filter`, SSRF (cloud metadata), XXE,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PHANTOM v5.3 - ULTIMATE Web Vulnerability Scanner
-Flask Web App | Render.com | 71 Modules | HTML/JSON Reports | OWASP+CWE Mapping
+PHANTOM v5.4 - ULTIMATE Web Vulnerability Scanner
+Flask Web App | Render.com | 72 Modules | Authenticated Scan | API/Swagger | HTML Reports
 """
 import base64,hashlib,hmac,json,math,os,random,re,socket,ssl,sys,threading,time,uuid,warnings
 from collections import deque
@@ -27,7 +27,7 @@ except: PW_OK=False
 PORT=int(os.environ.get("PORT",5000))
 THREADS=int(os.environ.get("PHANTOM_THREADS",24)); TIMEOUT=int(os.environ.get("PHANTOM_TIMEOUT",7))
 DEPTH=int(os.environ.get("PHANTOM_DEPTH",3)); MAXURLS=150
-DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.3"
+DELAY=float(os.environ.get("PHANTOM_DELAY",0.0)); VER="5.4"
 FAST=os.environ.get("PHANTOM_FAST","1")!="0"          # speed-first mode (default on)
 SCAN_BUDGET=int(os.environ.get("PHANTOM_BUDGET","300"))# hard time budget (seconds)
 MAX_PARAM=6 if FAST else 12                            # params tested per URL
@@ -207,6 +207,8 @@ class CVSSv31:
         "AI Prompt Injection":dict(av="N",ac="L",pr="N",ui="N",s="C",c="H",i="H",a="N"),
         "Insecure postMessage":dict(av="N",ac="H",pr="N",ui="R",s="C",c="L",i="L",a="N"),
         "JWT Weakness":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="H",a="N"),
+        "Exposed API Documentation":dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="N",a="N"),
+        "Unauthenticated API Endpoint":dict(av="N",ac="L",pr="N",ui="N",s="U",c="H",i="N",a="N"),
     }
     def score(self,vtype):
         vec=self.VV.get(vtype,dict(av="N",ac="L",pr="N",ui="N",s="U",c="L",i="L",a="N"))
@@ -778,6 +780,8 @@ VULN_IMPACT={
     "AI Prompt Injection":"User input reaches the LLM prompt unfiltered — jailbreak, data exfiltration, tool abuse (LLM01)",
     "Insecure postMessage":"window 'message' handler skips origin check — any window injects data (DOM XSS / logic abuse)",
     "JWT Weakness":"Token accepts alg:none, leaks sensitive claims, or never expires — forgeable / replayable auth",
+    "Exposed API Documentation":"Public Swagger/OpenAPI spec maps the entire API surface for an attacker",
+    "Unauthenticated API Endpoint":"API endpoint returns data with no authentication — broken access control",
 }
 VULN_FIX={
     "SQL Injection":["Use parameterized queries: cursor.execute('SELECT * FROM t WHERE id=%s',(id,))","Apply strict input whitelist","Enforce least-privilege DB user"],
@@ -857,6 +861,8 @@ VULN_FIX={
     "AI Prompt Injection":["Separate system and user roles; never concatenate user text into the system prompt","Validate/deny-list injection phrases and constrain output","Sandbox tool/function calls and enforce least privilege"],
     "Insecure postMessage":["Always verify event.origin against an allow-list","Validate event.data schema before use","Never eval or inject message data into the DOM"],
     "JWT Weakness":["Reject alg:none and pin the expected algorithm","Set short exp and validate it server-side","Keep no sensitive data in the payload; use strong signing keys"],
+    "Exposed API Documentation":["Restrict Swagger/OpenAPI to authenticated staff or internal networks","Disable interactive docs in production","Serve the spec only behind auth"],
+    "Unauthenticated API Endpoint":["Require authentication on every API route","Enforce object- and function-level authorization","Default-deny and add auth middleware globally"],
 }
 
 # ══ OWASP TOP 10 (2021) + CWE TAXONOMY ═══════════════════════════════════════
@@ -923,6 +929,7 @@ VULN_TAXONOMY = {
     "Vulnerable JS Library":("CWE-1035","A06"), "Missing SRI":("CWE-353","A08"),
     "AI Prompt Injection":("CWE-1427","A03"), "Insecure postMessage":("CWE-940","A08"),
     "JWT Weakness":("CWE-347","A02"),
+    "Exposed API Documentation":("CWE-200","A05"), "Unauthenticated API Endpoint":("CWE-306","A01"),
 }
 def taxonomy(vtype):
     """Return (cwe, owasp_category_label) for a finding type, with a safe default."""
@@ -969,6 +976,11 @@ class ScanJob:
         self.oob_token   = self.id + uuid.uuid4().hex[:8]
         self.oob_events  = []
         self.api_info    = {}
+        # Authenticated-scan state (populated from the scan request / CLI flags)
+        self.auth_cfg     = {}     # raw config: cookie / bearer / login_url+login_data
+        self.auth_headers = {}     # e.g. {"Authorization": "Bearer ..."}
+        self.auth_cookies = {}     # session cookies to attach to every request
+        self.authenticated = False
 
     def over_budget(self):
         return time.time() > self.deadline
@@ -1046,8 +1058,17 @@ class ScanJob:
         # Present as a real browser session (coherent Client Hints + Fetch
         # Metadata + same-site Referer) so passive WAF/Cloudflare checks pass.
         h = realistic_headers(self.ua, referer=self._origin)
+        # Attach auth (bearer/session headers) so protected areas are reachable.
+        if self.auth_headers:
+            h.update(self.auth_headers)
         # Merge caller-supplied headers instead of colliding with the defaults
         h.update(kw.pop("headers", None) or {})
+        # Attach session cookies (thread-local sessions don't share a jar, so we
+        # carry auth cookies explicitly on every request).
+        if self.auth_cookies:
+            merged = dict(self.auth_cookies)
+            merged.update(kw.pop("cookies", None) or {})
+            kw["cookies"] = merged
         # Let callers override redirect behaviour without a kwarg collision
         allow_redirects = kw.pop("allow_redirects", True)
         self._ua += 1
@@ -4079,6 +4100,63 @@ def mod_jwt_deep(job):
                      code=_snippet(json.dumps({"header": hdr, "payload": pl}), 0))
 
 
+OPENAPI_PATHS = ["/swagger.json", "/openapi.json", "/api-docs", "/api/swagger.json",
+                 "/v2/api-docs", "/v3/api-docs", "/swagger/v1/swagger.json",
+                 "/api/openapi.json", "/docs/openapi.json", "/swagger/doc.json"]
+
+def mod_openapi(job):
+    """Discover and parse an exposed OpenAPI/Swagger spec, record the API surface,
+    and test a few endpoints for missing authentication (broken access control)."""
+    spec = None; spec_url = None
+    for p in OPENAPI_PATHS:
+        if job.over_budget():
+            return
+        r = job.req(job.url + p)
+        if not r or r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        if isinstance(data, dict) and ("swagger" in data or "openapi" in data or "paths" in data):
+            spec, spec_url = data, job.url + p
+            break
+    if not spec:
+        return
+
+    paths = spec.get("paths", {}) or {}
+    ver = spec.get("openapi") or spec.get("swagger") or "?"
+    job.add_vuln("Exposed API Documentation", spec_url,
+                 evidence=f"OpenAPI/Swagger {ver} spec is public — {len(paths)} paths / full API "
+                          f"surface exposed to attackers",
+                 code=_snippet(json.dumps(spec)[:1500], 0))
+    job.api_info["openapi"] = {"url": spec_url, "version": str(ver), "paths": len(paths)}
+
+    # base path (Swagger v2) so we hit real routes
+    base = spec.get("basePath", "") or ""
+    tested = 0
+    for path, methods in list(paths.items())[:20]:
+        if job.over_budget() or tested >= 8:
+            break
+        if not isinstance(methods, dict) or "get" not in {m.lower() for m in methods}:
+            continue
+        # substitute path params with a harmless value
+        concrete = re.sub(r"\{[^}]+\}", "1", path)
+        url = job.url.rstrip("/") + base + concrete
+        # request WITHOUT auth to see if the endpoint is world-readable
+        r = job.req(url, headers={"Authorization": ""})
+        tested += 1
+        if r and r.status_code == 200 and ("json" in r.headers.get("Content-Type", "").lower()
+                                           or r.text.strip().startswith(("{", "["))):
+            looks_sensitive = re.search(r"(?i)user|admin|account|email|token|order|payment|secret", r.text[:500])
+            if looks_sensitive:
+                job.add_vuln("Unauthenticated API Endpoint", url,
+                             evidence=f"{concrete} returns JSON data without authentication — "
+                                      f"broken object/function-level access control",
+                             code=_snippet(r.text, 0))
+    job.log(f"OpenAPI: parsed {len(paths)} paths, probed {tested} endpoint(s)", "OK")
+
+
 # ══ PHASE 3 ORCHESTRATOR ═════════════════════════════════════════════════════
 def phase_vulns(job):
     # Speed: collapse identical URL templates so we don't re-test the same shape
@@ -4103,10 +4181,11 @@ def phase_vulns(job):
                  mod_secrets_comments,
                  # round-6: modern surface
                  mod_vuln_js_libs, mod_sri, mod_ai_prompt_injection,
-                 mod_postmessage, mod_jwt_deep)
+                 mod_postmessage, mod_jwt_deep, mod_openapi)
     total = len(all_urls) * len(per_url_mods) + len(site_mods) + 2 + 2 + 4 + 5
     job.set_phase("Phase 3: Vulns & Exploits", total)
-    job.log(f"Testing {len(all_urls)} unique URL shapes with 71 modules (FAST={FAST})...", "INFO")
+    job.log(f"Testing {len(all_urls)} unique URL shapes with 72 modules "
+            f"({'AUTH' if job.authenticated else 'unauth'}, FAST={FAST})...", "INFO")
 
     # Out-of-band payloads planted first so call-backs have the whole scan to arrive
     try:
@@ -4433,9 +4512,50 @@ def analyze_attack_chains(job):
         job.log(f"Chain analysis: {added} attack path(s) identified", "OK")
 
 
+# == AUTHENTICATED SCAN SETUP =================================================
+def phase_auth(job):
+    """Set up an authenticated session so protected areas are actually scanned.
+    Supports a raw Cookie header, a Bearer token, and form-based login (the
+    scanner logs in and captures the resulting session cookies)."""
+    cfg = job.auth_cfg
+    if not cfg:
+        return
+    job.log("Auth: configuring authenticated scan...", "INFO")
+    if cfg.get("bearer"):
+        job.auth_headers["Authorization"] = "Bearer " + cfg["bearer"].strip()
+        job.log("Auth: using supplied Bearer token", "OK")
+    if cfg.get("cookie"):
+        for part in cfg["cookie"].split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                job.auth_cookies[k.strip()] = v.strip()
+        job.log(f"Auth: using {len(job.auth_cookies)} supplied cookie(s)", "OK")
+    if cfg.get("login_url") and cfg.get("login_data"):
+        try:
+            data = dict(parse_qsl(cfg["login_data"]))
+            r = job.req(cfg["login_url"], method="POST", data=data, allow_redirects=True)
+            # Capture the full session jar (cookies may be set mid-redirect).
+            for k, v in http().cookies.get_dict().items():
+                job.auth_cookies[k] = v
+            code = r.status_code if r is not None else "no-response"
+            job.log(f"Auth: form login POST -> {code}, "
+                    f"{len(job.auth_cookies)} cookie(s) captured", "OK")
+        except Exception as e:
+            job.log(f"Auth: form login failed: {str(e)[:60]}", "WARN")
+    job.authenticated = bool(job.auth_headers or job.auth_cookies)
+    if job.authenticated:
+        r = job.req(job.url)
+        body = (r.text.lower() if r else "")
+        active = any(w in body for w in ("logout", "log out", "sign out", "my account", "dashboard"))
+        job.log("Auth: session " + ("looks ACTIVE (logout link seen)" if active
+                                     else "configured (login state unconfirmed)"),
+                "OK" if active else "WARN")
+
+
 # == MAIN SCAN RUNNER =========================================================
 def run_scan(job):
     try:
+        phase_auth(job)                    # authenticate first so all requests carry the session
         phase_osint(job)
         phase_ports(job)
         phase_spider(job)
@@ -4473,7 +4593,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PHANTOM v5.3 — Ultimate Web Scanner</title>
+<title>PHANTOM v5.4 — Ultimate Web Scanner</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#080c10;--bg2:#0d1117;--bg3:#161b22;--bd:#21262d;
@@ -4514,6 +4634,11 @@ input[type=text]:focus{border-color:var(--cy)}
   word-break:break-all;line-height:1.5;overflow-x:auto}
 .cli-c .cc{color:var(--cy)}
 .cli-n{color:var(--dm);font-size:.66rem;margin-top:6px}
+.auth-box{margin-top:12px;background:#0d1117;border:1px solid var(--bd);border-radius:8px;padding:6px 12px 12px}
+.auth-box summary{cursor:pointer;color:var(--mg);font-size:.76rem;font-weight:700;padding:6px 0}
+.auth-box label{margin-top:8px}
+.auth-box input[type=text]{margin-top:2px}
+.auth-or{text-align:center;color:var(--dm);font-size:.68rem;margin:10px 0 2px}
 #pa{display:none;margin-bottom:12px}
 .pc{background:var(--bg3);border:1px solid var(--bd);border-radius:12px;padding:14px 18px;margin-bottom:10px}
 .ptop{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
@@ -4603,7 +4728,7 @@ input[type=text]:focus{border-color:var(--cy)}
 ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝</pre>
   <div class="hdr-txt">
-    <h1>PHANTOM<span class="bdg br">v5.3</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">WAF-AWARE RL</span><span class="bdg bc">OWASP+CWE</span><span class="bdg byr">71 MODULES</span></h1>
+    <h1>PHANTOM<span class="bdg br">v5.4</span><span class="bdg bc">CVSS v3.1</span><span class="bdg bm">OOB ENGINE</span><span class="bdg bg">WAF-AWARE RL</span><span class="bdg bc">OWASP+CWE</span><span class="bdg byr">72 MODULES</span></h1>
     <p>Persistent Heuristic Attack &amp; Network Threat Observation Machine — Ultimate Edition</p>
     <p style="color:#f8514970;font-size:.65rem;margin-top:1px">⚠ For authorized penetration testing only — IT Act 2000, Section 66</p>
   </div>
@@ -4618,7 +4743,7 @@ input[type=text]:focus{border-color:var(--cy)}
       <label>Target URL</label>
       <input type="text" id="iu" value="http://testphp.vulnweb.com/" placeholder="https://your-authorized-target.com">
     </div>
-    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.3</button>
+    <button type="button" class="btn" id="sb" onclick="go()">⚡ LAUNCH PHANTOM v5.4</button>
     <div id="err-box" style="display:none;margin-top:10px;background:#f8514918;border:1px solid #f8514960;
       border-radius:8px;padding:10px 14px;color:#f85149;font-size:.8rem;font-family:monospace"></div>
     <div class="qt" style="margin-top:10px">
@@ -4628,11 +4753,24 @@ input[type=text]:focus{border-color:var(--cy)}
       <a href="#" onclick="su('http://testphp.vulnweb.com/listproducts.php?cat=1')">SQLi test</a>
       <a href="#" onclick="su('http://testphp.vulnweb.com/artists.php?artist=1')">artists.php</a>
     </div>
+    <details class="auth-box">
+      <summary>🔐 Authenticated scan (optional) — test protected areas</summary>
+      <label>Cookie header (session=...; token=...)</label>
+      <input type="text" id="au_cookie" placeholder="session=abc123; csrftoken=xyz">
+      <label>Bearer token</label>
+      <input type="text" id="au_bearer" placeholder="eyJhbGciOi... (without 'Bearer ')">
+      <div class="auth-or">— or form login —</div>
+      <label>Login URL</label>
+      <input type="text" id="au_login_url" placeholder="https://target.com/login">
+      <label>Login data (urlencoded)</label>
+      <input type="text" id="au_login_data" placeholder="username=admin&amp;password=secret">
+      <div class="cli-n">The scanner logs in, captures the session, and scans behind auth. Use only on sites you're authorized to test.</div>
+    </details>
     <div class="cli-box">
       <div class="cli-h">📱 Run in Termux / any terminal (headless → JSON file)</div>
       <pre class="cli-c"><span class="cc">pkg install python git -y &amp;&amp; pip install -r requirements.txt</span>
-<span class="cc">python phantom.py https://your-authorized-target.com -o report.json</span></pre>
-      <div class="cli-n">Writes a full JSON report — no browser needed. Works even if the web app can't run here.</div>
+<span class="cc">python phantom.py https://your-authorized-target.com -o report.json --html</span></pre>
+      <div class="cli-n">Writes JSON + HTML report — no browser needed. Works even if the web app can't run here.</div>
     </div>
   </div>
 </div>
@@ -4703,7 +4841,7 @@ const PH=['Phase 0: OSINT & Recon','Phase 1: Port Scan','Phase 2: Spider & JS','
 function su(u){document.getElementById('iu').value=u;return false}
 function showErr(msg){
   const b=document.getElementById('sb');
-  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.3';
+  b.disabled=false;b.textContent='⚡ LAUNCH PHANTOM v5.4';
   document.getElementById('fa').style.display='block';
   document.getElementById('pa').style.display='none';
   const eb=document.getElementById('err-box');
@@ -4728,6 +4866,10 @@ async function go(){
   et=setInterval(function(){es++;document.getElementById('pm').textContent=es+'s elapsed...';},1000);
   try{
     const fd=new FormData();fd.append('url',url);
+    ['cookie','bearer','login_url','login_data'].forEach(function(k){
+      const el=document.getElementById('au_'+k);
+      if(el&&el.value.trim())fd.append(k,el.value.trim());
+    });
     document.getElementById('sb').textContent='SCANNING...';
     const resp=await fetch('/scan',{method:'POST',body:fd});
     if(!resp.ok){showErr('Server returned '+resp.status+'. Check Render logs.');return;}
@@ -4885,6 +5027,7 @@ def job_report(job):
         "scan_id":     job.id,
         "generated":   datetime.now().isoformat(timespec="seconds"),
         "status":      job.status,
+        "authenticated": job.authenticated,
         "elapsed_seconds": round(time.time()-job.start,1) if job.status=="running" else job.elapsed,
         "summary": {
             "risk":           risk,
@@ -5042,6 +5185,7 @@ def render_html_report(rep):
             f'<div class="meta"><span><b>Scan ID</b> {esc(rep["scan_id"])}</span>'
             f'<span><b>Generated</b> {esc(rep["generated"])}</span>'
             f'<span><b>Duration</b> {esc(rep["elapsed_seconds"])}s</span>'
+            f'<span><b>Mode</b> {"Authenticated" if rep.get("authenticated") else "Unauthenticated"}</span>'
             f'<span><b>Scanner</b> PHANTOM v{esc(rep["version"])}</span></div></div></div>')
 
     exec_block = (f'<div class="exec">'
@@ -5088,6 +5232,14 @@ def start_scan():
     if not url: return jsonify({"error":"URL required"}),400
     if not url.startswith(("http://","https://")): url = "https://"+url
     job = ScanJob(url)
+    # Optional authenticated-scan config (cookie / bearer / form login).
+    auth = {}
+    for k in ("cookie", "bearer", "login_url", "login_data"):
+        v = (request.form.get(k) or "").strip()
+        if v:
+            auth[k] = v
+    if auth:
+        job.auth_cfg = auth
     scans[job.id] = job
     threading.Thread(target=run_scan, args=(job,), daemon=True).start()
     return jsonify({"scan_id": job.id})
@@ -5169,7 +5321,7 @@ def oob_collect_endpoint(token, rest):
 def health():
     active = sum(1 for s in scans.values() if s.status=="running")
     return jsonify({"status":"ok","version":VER,"active_scans":active,
-                    "modules":71,"pooling":True,"human_like":True,
+                    "modules":72,"pooling":True,"human_like":True,
                     "oob_ready":bool(OOB_BASE),"headless":PW_OK,"fast":FAST})
 
 USAGE = f"""PHANTOM v{VER} — web vulnerability scanner
@@ -5184,6 +5336,11 @@ CLI / TERMUX (headless, writes a JSON report):
   python phantom.py <url> --quiet             # only print the final summary
   python phantom.py <url> --print             # also echo the JSON to the screen
 
+AUTHENTICATED SCAN (test protected areas):
+  python phantom.py <url> --cookie "session=abc; token=xyz"
+  python phantom.py <url> --bearer "<jwt-or-token>"
+  python phantom.py <url> --login-url <login> --login-data "user=admin&pass=secret"
+
 Only scan systems you own or are explicitly authorized to test.
 """
 
@@ -5193,6 +5350,7 @@ def _cli_main(argv):
     if argv[0] in ("-h", "--help", "help"):
         print(USAGE); return
     url = None; out = None; quiet = False; echo = False; want_html = False
+    auth = {}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -5204,6 +5362,11 @@ def _cli_main(argv):
             echo = True
         elif a == "--html":
             want_html = True
+        elif a in ("--cookie", "--bearer", "--login-url", "--login-data"):
+            key = a.lstrip("-").replace("-", "_")
+            i += 1
+            if i < len(argv):
+                auth[key] = argv[i]
         elif not a.startswith("-") and url is None:
             url = a
         i += 1
@@ -5213,9 +5376,11 @@ def _cli_main(argv):
         url = "https://" + url
 
     job = ScanJob(url)
+    if auth:
+        job.auth_cfg = auth
     scans[job.id] = job
     print(f"[*] PHANTOM v{VER} — target: {url}")
-    print(f"[*] {'FAST' if FAST else 'FULL'} mode | 71 modules | budget {SCAN_BUDGET}s | id {job.id}\n")
+    print(f"[*] {'FAST' if FAST else 'FULL'} mode | 72 modules | budget {SCAN_BUDGET}s | id {job.id}\n")
 
     t = threading.Thread(target=run_scan, args=(job,), daemon=True)
     t.start()
@@ -5267,6 +5432,6 @@ if __name__ == "__main__":
         _cli_main(_args)
     else:
         print(f"[*] PHANTOM v{VER} starting on port {PORT}")
-        print(f"[*] 71 modules | HTML/JSON reports | OWASP+CWE | real-browser | pooling | FAST={FAST}")
+        print(f"[*] 72 modules | HTML/JSON reports | OWASP+CWE | real-browser | pooling | FAST={FAST}")
         print(f"[*] Web UI: http://localhost:{PORT}   |   CLI: python phantom.py <url>")
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
