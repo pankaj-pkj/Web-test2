@@ -77,7 +77,7 @@ contains the issue — so you can see *what* is wrong and *where* to fix it.
 | `PHANTOM_BUDGET` | `300` | Hard per-scan time budget (seconds) |
 | `PHANTOM_THREADS` | `24` | Concurrent workers |
 
-## Detection coverage (66 modules)
+## Detection coverage (71 modules)
 
 **Injection:** SQL Injection (error/boolean/time/UNION), SQLi via forms, NoSQL
 Injection, Command Injection, LFI / `php://filter`, SSRF (cloud metadata), XXE,
@@ -107,6 +107,13 @@ storage buckets (S3/GCS/Azure), Email security (SPF/DMARC), `security.txt`.
 **APIs & cross-origin:** GraphQL introspection / DoS / batching, **GraphQL CSRF**
 (GET/form-encoded mutations), **JSONP** cross-origin data theft, CORS
 misconfiguration, mass assignment, excessive data exposure, HTTP method override.
+
+**Supply-chain, client-side & AI (modern):** vulnerable front-end library
+detection (retire.js-style — jQuery/Angular/Bootstrap/Lodash/Moment/Handlebars),
+missing **Subresource Integrity (SRI)** on third-party scripts, **AI/LLM prompt
+injection** probe (benign canary, OWASP LLM01), insecure **postMessage** handlers
+(no origin check), and deep **JWT** analysis (alg:none, missing expiry, sensitive
+claims).
 
 **Infra / transport / config:** Open dangerous ports & service CVEs,
 Unauthenticated datastores (Redis/Mongo/Elasticsearch/Memcached), FTP anonymous
