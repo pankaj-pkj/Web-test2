@@ -1,12 +1,23 @@
 # PHANTOM v5.3 — Web Vulnerability Scanner
 
+![CI](https://github.com/pankaj-pkj/web-test2/actions/workflows/ci.yml/badge.svg)
+
 ● Live Scanning Web Interface (Render Deployment): https://web-testing-ybe5.onrender.com/
 
 An autonomous, single-file web application security scanner with a live Flask UI.
 It runs autonomous phases — **OSINT/Recon → Port Scan → Spider + Headless DOM →
-66 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
+71 Vulnerability Modules** — assigns a **CVSS v3.1** score to every finding, runs a
 **false-positive verification** pass, and correlates issues into **multi-step attack
 chains**. **No paid API or LLM required — pure Python.**
+
+## What's new in v5.3
+- **Professional HTML report** — executive summary, risk rating, severity chart,
+  **OWASP Top 10 (2021)** breakdown and per-finding **CWE + OWASP + CVSS** with the
+  vulnerable-code snippet, remediation and PoC. Self-contained → Ctrl-P for a PDF.
+  Buttons in the UI, `GET /report/<id>.html`, and `--html` in the CLI.
+- **5 modern modules**: vulnerable-JS-library detection, missing **SRI**,
+  **AI/LLM prompt-injection** probe, insecure **postMessage**, and deep **JWT**
+  analysis — bringing the total to **71**.
 
 ## What's new in v5.2
 - **Real-browser traffic** — every request now sends a coherent Chrome/Firefox/Safari
@@ -34,7 +45,7 @@ chains**. **No paid API or LLM required — pure Python.**
   Injection** (AngularJS/Vue), and **Source-Map Recovery**.
 
 ## Highlights
-- **66 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
+- **71 vulnerability detection modules** (OWASP Top 10 + modern + legacy techniques)
 - **Out-of-Band (OOB) engine** — the scanner's own public URL is the interaction
   listener, so blind SSRF / RCE / XXE are *confirmed* via real call-backs (no
   third-party collaborator service needed)
@@ -139,6 +150,15 @@ systems you own or are permitted to test.
 pip install -r requirements.txt
 python phantom.py
 # open http://localhost:5000
+```
+
+## Tests & CI
+An automated **pytest** suite covers the scoring/taxonomy logic, browser-header
+coherence, report building/rendering and live detection modules (against a local
+stub). **GitHub Actions** runs it on every push across Python 3.10–3.12.
+```bash
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
 ## Run in Termux / any terminal (headless → JSON file)

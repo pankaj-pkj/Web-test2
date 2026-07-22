@@ -1,0 +1,200 @@
+"""
+PHANTOM — automated test suite (pytest).
+
+Covers the pure logic (CVSS scoring, OWASP/CWE taxonomy, browser-header
+coherence, URL de-duplication, the RL mutator, report building/rendering) plus
+a few live integration tests that run real modules against a local stub server.
+
+Run:  pytest -q
+"""
+import base64
+import json
+import threading
+import time
+
+import pytest
+
+import phantom
+
+
+# ── Pure-logic unit tests ─────────────────────────────────────────────────────
+def test_cvss_known_type_is_critical():
+    score, vector, sev = phantom.CVSS.score("SQL Injection")
+    assert 9.0 <= score <= 10.0
+    assert sev == "CRITICAL"
+    assert vector.startswith("CVSS:3.1/")
+
+
+def test_cvss_unknown_type_falls_back_safely():
+    score, vector, sev = phantom.CVSS.score("Totally Unknown Finding")
+    assert 0.0 <= score <= 10.0
+    assert sev in {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+
+
+@pytest.mark.parametrize("vtype,cwe_prefix", [
+    ("SQL Injection", "CWE-89"),
+    ("Reflected XSS", "CWE-79"),
+    ("SSRF", "CWE-918"),
+    ("AI Prompt Injection", "CWE-1427"),
+    ("Missing SRI", "CWE-353"),
+])
+def test_taxonomy_maps_cwe_and_owasp(vtype, cwe_prefix):
+    cwe, owasp = phantom.taxonomy(vtype)
+    assert cwe == cwe_prefix
+    assert owasp.startswith("A") and ":2021" in owasp
+
+
+def test_taxonomy_default_for_unknown():
+    cwe, owasp = phantom.taxonomy("No Such Type")
+    assert cwe and owasp  # always returns something usable
+
+
+def test_realistic_headers_chrome_has_client_hints():
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0 Safari/537.36"
+    h = phantom.realistic_headers(ua, referer="http://x")
+    assert "sec-ch-ua" in h
+    assert h["Sec-Fetch-Site"] == "same-origin"
+    assert h["Referer"] == "http://x"
+
+
+@pytest.mark.parametrize("ua", [
+    "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.2 Safari/605.1.15",
+])
+def test_realistic_headers_non_chromium_omits_client_hints(ua):
+    h = phantom.realistic_headers(ua)
+    assert "sec-ch-ua" not in h
+    assert h["Sec-Fetch-Site"] == "none"
+
+
+def test_accept_encoding_never_advertises_undecodable_brotli():
+    # If brotli isn't importable, "br" must not be advertised (else responses
+    # come back undecodable and every text-based detector silently breaks).
+    if not phantom._BROTLI_OK:
+        assert "br" not in phantom.ACCEPT_ENCODING
+    assert "gzip" in phantom.ACCEPT_ENCODING
+
+
+def test_dedup_collapses_same_url_shape():
+    urls = [
+        "http://t/item?id=1", "http://t/item?id=2", "http://t/item?id=3",
+        "http://t/other?q=a",
+    ]
+    out = phantom._dedup_urls(urls)
+    # the three id=N URLs share a shape → collapsed to (far) fewer than 4
+    assert len(out) < len(urls)
+
+
+def test_ver_tuple_parsing_and_ordering():
+    assert phantom._ver_tuple("3.3.1") < phantom._ver_tuple("3.5.0")
+    assert phantom._ver_tuple("1.8") == (1, 8, 0)
+
+
+def test_adaptive_mutator_warm_start_biases_known_evasions():
+    m = phantom.AdaptiveMutator()
+    picks = m.warm_start("Cloudflare")
+    assert picks  # returns the strategies it boosted
+    assert all(m.Q[p] >= 0.6 for p in picks)
+
+
+def test_adaptive_mutator_apply_transforms_change_payload():
+    m = phantom.AdaptiveMutator()
+    _, mutated = m.mutate("<script>alert(1)</script>", strat="url_encode")
+    assert "%3C" in mutated  # '<' url-encoded
+
+
+# ── Report building / rendering ───────────────────────────────────────────────
+def _job_with_findings():
+    job = phantom.ScanJob("http://demo.example.com")
+    job.add_vuln("SQL Injection", "http://demo.example.com/p?id=1", param="id",
+                 payload="' OR 1=1--", evidence="SQL syntax error",
+                 code="q = 'SELECT * FROM u WHERE id='+id")
+    job.add_vuln("Reflected XSS", "http://demo.example.com/s?q=x", param="q",
+                 payload="<script>alert(1)</script>", evidence="reflected unencoded")
+    job.status = "done"
+    job.elapsed = 4.2
+    return job
+
+
+def test_add_vuln_tags_cwe_and_owasp():
+    job = _job_with_findings()
+    for v in job.vulns:
+        assert v["cwe"] and v["owasp"]
+
+
+def test_add_vuln_dedupes_identical_evidence():
+    job = phantom.ScanJob("http://x")
+    job.add_vuln("SQL Injection", "http://x/a", evidence="same evidence text")
+    job.add_vuln("SQL Injection", "http://x/a", evidence="same evidence text")
+    assert len(job.vulns) == 1
+
+
+def test_job_report_structure():
+    rep = phantom.job_report(_job_with_findings())
+    for key in ("scanner", "version", "target", "summary", "vulnerabilities",
+                "attack_chains", "generated"):
+        assert key in rep
+    assert rep["summary"]["total_findings"] == 2
+    json.dumps(rep, default=str)  # must be JSON-serializable
+
+
+def test_html_report_is_valid_standalone():
+    html = phantom.render_html_report(phantom.job_report(_job_with_findings()))
+    assert html.startswith("<!DOCTYPE html>")
+    assert html.rstrip().endswith("</html>")
+    assert "OWASP Top 10" in html
+    assert html.count('class="finding"') == 2
+
+
+# ── Live integration tests (real modules vs a local stub) ─────────────────────
+@pytest.fixture(scope="module")
+def stub_server():
+    from flask import Flask, request, Response
+    app = Flask("stub")
+
+    @app.route("/p")
+    def p():
+        q = request.args.get("id", "")
+        if "'" in q:
+            return "<html>error in your SQL syntax near '''</html>"
+        return "<html>ok</html>"
+
+    @app.route("/api")
+    def api():
+        cb = request.args.get("callback", "")
+        return Response(f'{cb}({{"secret":1}})', mimetype="application/javascript")
+
+    port = 5177
+    t = threading.Thread(target=lambda: app.run(port=port, threaded=True), daemon=True)
+    t.start()
+    time.sleep(1.0)
+    return f"http://127.0.0.1:{port}"
+
+
+def test_sqli_detected_live(stub_server):
+    job = phantom.ScanJob(stub_server)
+    phantom.mod_sqli(job, stub_server + "/p?id=1")
+    assert any(v["type"] == "SQL Injection" for v in job.vulns)
+
+
+def test_jsonp_detected_live(stub_server):
+    job = phantom.ScanJob(stub_server)
+    phantom.mod_jsonp(job, stub_server + "/api?callback=x")
+    assert any(v["type"] == "JSONP Endpoint" for v in job.vulns)
+
+
+def test_report_endpoints_via_test_client():
+    job = _job_with_findings()
+    phantom.scans[job.id] = job
+    client = phantom.app.test_client()
+
+    r_json = client.get(f"/report/{job.id}.json")
+    assert r_json.status_code == 200
+    assert r_json.headers["Content-Type"].startswith("application/json")
+
+    r_html = client.get(f"/report/{job.id}.html")
+    assert r_html.status_code == 200
+    assert b"<!DOCTYPE html>" in r_html.data
+
+    assert client.get("/report/does-not-exist.json").status_code == 404
+    assert client.get("/health").status_code == 200
