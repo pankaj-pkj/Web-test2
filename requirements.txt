@@ -6,6 +6,7 @@ lxml>=5.0.0
 dnspython>=2.4.0
 python-whois>=0.8.0
 gunicorn>=21.0.0
+brotli>=1.1.0        # decode Brotli ("br") responses — without it, br-encoded pages can't be scanned
 
 # Optional — enables the Headless Browser (Dynamic DOM) engine.
 # The scanner runs fine without it (it degrades gracefully).

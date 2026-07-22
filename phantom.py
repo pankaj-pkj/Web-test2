@@ -62,6 +62,21 @@ def http():
 # Client Hints (sec-ch-ua*) and Fetch Metadata (Sec-Fetch-*). Passive WAF /
 # Cloudflare bot checks key off exactly these, so we mirror a genuine browser
 # session (matching UA↔hints, a same-site Referer, keep-alive + cookie reuse).
+# Only advertise an encoding we can actually decode. requests handles gzip/
+# deflate always, but Brotli ("br") needs the brotli package — advertising it
+# without that package makes servers return undecodable bytes, silently breaking
+# every text-based detection module. So gate "br" on real Brotli support.
+try:
+    import brotli as _brotli            # noqa: F401
+    _BROTLI_OK = True
+except Exception:
+    try:
+        import brotlicffi as _brotli    # noqa: F401
+        _BROTLI_OK = True
+    except Exception:
+        _BROTLI_OK = False
+ACCEPT_ENCODING = "gzip, deflate, br" if _BROTLI_OK else "gzip, deflate"
+
 def realistic_headers(ua, referer=None):
     # Only Chromium-family browsers emit Client Hints; Firefox/Safari do not.
     is_chromium = "Chrome" in ua and "Firefox" not in ua
@@ -71,7 +86,7 @@ def realistic_headers(ua, referer=None):
                    "image/avif,image/webp,image/apng,*/*;q=0.8,"
                    "application/signed-exchange;v=b3;q=0.7"),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": ACCEPT_ENCODING,
         "Upgrade-Insecure-Requests": "1",
         "Connection": "keep-alive",
         "DNT": "1",
