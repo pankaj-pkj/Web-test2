@@ -146,6 +146,74 @@ def test_html_report_is_valid_standalone():
     assert html.count('class="finding"') == 2
 
 
+# ── Proof engine (reproducible, copy-paste evidence) ──────────────────────────
+def test_shell_quote_roundtrips_embedded_quotes():
+    import shlex
+    tricky = "' OR '1'='1"
+    quoted = phantom._shq(tricky)
+    # the shell must parse the quoted form back to the exact original value
+    assert shlex.split(quoted) == [tricky]
+
+
+def test_curl_get_fills_real_params_and_replaces_injected():
+    cmd = phantom._curl_get("http://t/item?id=1&cat=books", "id", "' OR 1=1--")
+    assert cmd.startswith("curl -sk -G 'http://t/item'")
+    assert "cat=books" in cmd          # untouched param preserved
+    assert "id=" in cmd and "OR 1=1" in cmd  # injected param carries the payload
+
+
+def test_proof_engine_sqli_uses_extracted_value():
+    job = phantom.ScanJob("http://demo.example.com")
+    job.add_vuln("SQL Injection", "http://demo.example.com/p?id=1", param="id",
+                 payload="' OR '1'='1", evidence="SQL syntax error",
+                 extracted={"version": "8.0.32-MySQL"})
+    phantom.generate_poc(job)
+    pr = job.vulns[0]["proof"]
+    assert pr["command"].startswith("curl")
+    assert "8.0.32-MySQL" in pr["expect"]        # the confirming value is the proof
+    assert "8.0.32-MySQL" in pr["evidence"]
+
+
+def test_proof_engine_xss_gives_browser_alert_url():
+    job = phantom.ScanJob("http://demo.example.com")
+    job.add_vuln("Reflected XSS", "http://demo.example.com/s?q=x", param="q",
+                 payload="<svg onload=alert(1)>", evidence="reflected unencoded")
+    phantom.generate_poc(job)
+    pr = job.vulns[0]["proof"]
+    assert pr["browser"].startswith("http://demo.example.com/s?")
+    # canonical harmless proof payload is URL-encoded into the browser link
+    assert "alert" in pr["browser"] and "document.domain" in pr["browser"]
+
+
+def test_proof_pack_markdown_has_command_blocks():
+    job = _job_with_findings()
+    phantom.generate_poc(job)          # proofs are built during the scan flow
+    md = phantom.render_proof_pack(phantom.job_report(job))
+    assert md.startswith("# PHANTOM Proof Pack")
+    assert "```bash" in md
+    assert "**Expected result:**" in md
+    assert md.count("## ") >= 2  # one section per finding
+
+
+def test_proof_pack_empty_scan_is_graceful():
+    job = phantom.ScanJob("http://x")
+    job.status = "done"; job.elapsed = 1.0
+    md = phantom.render_proof_pack(phantom.job_report(job))
+    assert "nothing to reproduce" in md.lower()
+
+
+def test_proof_route_via_test_client():
+    job = _job_with_findings()
+    phantom.generate_poc(job)
+    phantom.scans[job.id] = job
+    client = phantom.app.test_client()
+    r = client.get(f"/proof/{job.id}.md")
+    assert r.status_code == 200
+    assert r.headers["Content-Type"].startswith("text/markdown")
+    assert b"Proof Pack" in r.data
+    assert client.get("/proof/does-not-exist.md").status_code == 404
+
+
 # ── Live integration tests (real modules vs a local stub) ─────────────────────
 @pytest.fixture(scope="module")
 def stub_server():

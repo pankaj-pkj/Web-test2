@@ -10,6 +10,24 @@ It runs autonomous phases — **OSINT/Recon → Port Scan → Spider + Headless 
 **false-positive verification** pass, and correlates issues into **multi-step attack
 chains**. **No paid API or LLM required — pure Python.**
 
+## What's new — Reproducible Proof engine
+- **Proof Pack** — every finding now ships a **single copy-paste command** with the
+  **real target URL and parameters already filled in**, plus the **exact result to
+  look for**, so a reviewer can independently reproduce the result (answers "prove
+  the finding is real, don't just claim it"). For **reflected XSS** it also emits a
+  paste-into-the-browser link that pops a harmless `alert(document.domain)` — the
+  standard *visual* proof of script execution. For **SQLi** it shows the single
+  confirming value the scanner extracted (e.g. the DB version) — a proof value, not
+  a bulk data dump.
+- **Where to get it:** the CLI `--proof` (writes `<name>_proof.md`) or `--all`
+  (JSON + HTML + Proof Pack together); the web route `GET /proof/<scan_id>.md`; and
+  the same proof is embedded in each finding of the HTML report ("Expected result").
+- **Termux-friendly** — a fast reachability **preflight** fails with a clear,
+  actionable message (bad URL / DNS / offline) instead of grinding through an
+  unreachable host, and unexpected errors print a plain hint instead of a traceback.
+- **Demonstrate legally** — see **[Proving findings are real](#proving-findings-are-real--demo-guide)**
+  for authorized practice targets you can safely show a reviewer.
+
 ## What's new in v5.4
 - **Authenticated scanning** — log in and test protected areas. Supports a raw
   **Cookie** header, a **Bearer** token, or **form login** (the scanner submits
@@ -82,9 +100,12 @@ chains**. **No paid API or LLM required — pure Python.**
    weak results are flagged for manual review (false-positive reduction).
 3. **Chain Attacks** — correlates findings into multi-step attack paths and shows
    the escalated, combined impact.
-4. **Generate Exploits (PoC)** — produces a safe, reproduction-only Proof-of-Concept
-   (the exact request/payload that demonstrated the issue) plus CVE references, for
-   verification and remediation.
+4. **Generate Proof (PoC)** — produces a safe, reproduction-only Proof-of-Concept
+   for every finding: the exact request (real URL + parameters filled in), **what to
+   observe** that confirms it, the concrete evidence (e.g. the extracted DB version),
+   and — for reflected XSS — a browser link that pops a harmless
+   `alert(document.domain)`. Exported as a copy-paste **Proof Pack** (`--proof`).
+   Proofs read a single confirming value and never modify the target.
 5. **Reverse Engineer** — static analysis of shipped artifacts (JS bundles, source
    maps, wasm, apk, jar, exe…): string/secret extraction and dangerous-call detection.
 
@@ -186,6 +207,8 @@ pip install -r requirements.txt
 # scan and save a JSON report
 python phantom.py https://your-authorized-target.com
 python phantom.py https://target.com -o report.json   # choose the output file
+python phantom.py https://target.com --proof           # also write a copy-paste Proof Pack (.md)
+python phantom.py https://target.com --all             # JSON + HTML + Proof Pack together
 python phantom.py https://target.com --quiet           # only the final summary
 python phantom.py https://target.com --print           # also echo the JSON
 python phantom.py --help                                # usage
@@ -204,8 +227,37 @@ in any browser and **Ctrl-P → Save as PDF** for a submission-ready document.
 
 - **In the UI**: the results page has **📄 HTML Report**, **⬇ Download JSON Report**
   and **⧉ Open JSON (API)** buttons.
-- **Direct URLs**: `GET /report/<scan_id>.html` (viewable report) and
-  `GET /report/<scan_id>.json` (structured download). `POST /scan` (form field
+- **Direct URLs**: `GET /report/<scan_id>.html` (viewable report),
+  `GET /report/<scan_id>.json` (structured download) and
+  `GET /proof/<scan_id>.md` (copy-paste Proof Pack). `POST /scan` (form field
   `url`) starts a scan and returns `{"scan_id": ...}`; poll
   `GET /api/status/<scan_id>` for progress.
-- **CLI**: add `--html` to also write the HTML report next to the JSON file.
+- **CLI**: add `--html` for the HTML report, `--proof` for the Proof Pack, or
+  `--all` to write JSON + HTML + Proof Pack next to each other.
+
+## Proving findings are real — demo guide
+When a reviewer says *"this looks strong, but prove it's real,"* the answer is a
+**reproducible proof**, not a live defacement. This tool gives you exactly that:
+run the scan, then hand over the **Proof Pack** — each finding has one command the
+reviewer can run and the exact result to expect.
+
+Demonstrate against a target you are **allowed** to exploit fully:
+- **`http://testphp.vulnweb.com/`** — a public, intentionally vulnerable site
+  published by Acunetix specifically for practice. SQLi/XSS reproduce reliably here.
+- **DVWA** or **OWASP Juice Shop** — deliberately vulnerable apps you run on your
+  own machine (Docker one-liners), so anything you demonstrate is fully legal.
+
+```bash
+# full evidence bundle against an authorized practice target
+python phantom.py http://testphp.vulnweb.com/ --all -o demo.json
+# → demo.json, demo.html (Ctrl-P → PDF), demo_proof.md (copy-paste proof)
+```
+
+Then, in front of the reviewer: open a finding in `demo_proof.md`, run its command,
+and show the **Expected result** matching — or for XSS, open the browser-proof link
+and show the `alert(document.domain)` popup. That is a genuine, professional
+proof-of-exploitability. Do **not** dump real user data or deface a live production
+site to "prove" a bug — it's unnecessary, and illegal on anything you don't own.
+
+> Educational / authorized-testing tool. Only scan systems you own or have
+> explicit permission to test.

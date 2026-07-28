@@ -3706,50 +3706,132 @@ def _cve_refs(job):
             refs.append(m.group(0))
     return refs
 
+# ── Reproducible-proof helpers (copy-paste, real values, shell-safe) ─────────
+def _shq(s):
+    """POSIX-safe single-quote for one shell argument (handles embedded quotes)
+    so payloads with quotes/spaces paste into a terminal without breaking."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+def _curl_get(loc, param=None, payload=None):
+    """A single, copy-paste `curl` that reproduces a GET-based finding, with the
+    real target URL and every parameter filled in (the injected one replaced by
+    the confirmed payload). curl URL-encodes the value, so payloads stay intact."""
+    pr   = urlparse(loc)
+    base = f"{pr.scheme}://{pr.netloc}{pr.path}" if pr.scheme else loc
+    prms = dict(parse_qsl(pr.query))
+    if param is not None:
+        prms[param] = payload if payload is not None else prms.get(param, "")
+    parts = ["curl -sk -G " + _shq(base)]
+    for k, val in prms.items():
+        parts.append("--data-urlencode " + _shq(f"{k}={val}"))
+    return " \\\n     ".join(parts)
+
+def _url_with(loc, param, payload):
+    """Full URL with one parameter set to `payload` (URL-encoded) — a link you
+    paste into a browser for a visual proof (e.g. an XSS alert() popup)."""
+    pr   = urlparse(loc)
+    prms = dict(parse_qsl(pr.query)); prms[param] = payload
+    base = f"{pr.scheme}://{pr.netloc}{pr.path}" if pr.scheme else loc
+    return base + "?" + urlencode(prms)
+
+# Canonical, harmless XSS proof: pops the site's OWN origin in an alert() so a
+# human can SEE injected script execute. Standard PoC — it only shows a dialog
+# in the tester's own browser; it changes nothing on the server.
+XSS_PROOF = "<script>alert(document.domain)</script>"
+
+def _proof_for(job, v, cves):
+    """Build a structured, reproducible proof for one finding: how it was
+    confirmed · the exact command · what to observe · the concrete evidence.
+    Proofs read a single confirming value; they never bulk-extract or modify."""
+    t  = v["type"]; loc = v["location"]; p = v.get("parameter", "")
+    pl = v.get("payload", ""); ev = v.get("evidence", ""); ext = v.get("extracted") or {}
+    pr = {"how": "", "command": "", "expect": "", "evidence": ev, "browser": "", "cves": []}
+
+    if t.startswith("SQL Injection") and p:
+        pr["how"]     = f"A crafted value in the '{p}' parameter was processed by the backend database."
+        pr["command"] = _curl_get(loc, p, pl or "' OR '1'='1")
+        # Only a real DB value proves data leakage — ignore meta keys like the
+        # 'confidence'/'status' that verify_findings stamps onto every finding.
+        DB_KEYS = ("version", "db", "database", "user", "current_user")
+        leaked  = {k: val for k, val in ext.items() if k in DB_KEYS}
+        if leaked:
+            k, val = next(iter(leaked.items()))
+            pr["expect"]   = f"Response leaks live database data — {k} = {val} — proving our input ran as SQL."
+            pr["evidence"] = f"Extracted {k}: {val}"
+        elif "time-based" in ev.lower():
+            pr["expect"] = "Response is delayed >3s only when the injected SLEEP() runs — proving blind SQLi."
+        else:
+            pr["expect"] = "Response returns a database error that a normal value does not — the input reaches SQL."
+    elif t.startswith("Reflected XSS") and p:
+        pr["how"]     = f"Input in the '{p}' parameter is reflected into the page unescaped, so injected script runs."
+        pr["command"] = _curl_get(loc, p, pl or XSS_PROOF)
+        pr["expect"]  = "The payload appears verbatim (unescaped) in the HTML response body."
+        pr["browser"] = _url_with(loc, p, XSS_PROOF)
+    elif t in ("SSTI", "Expression Language Injection", "CSTI (Client-Side Template Injection)"):
+        pr["how"]     = f"A template expression in '{p or 'input'}' was evaluated server-side."
+        pr["command"] = _curl_get(loc, p, pl or "{{7*7}}") if p else "curl -sk " + _shq(loc)
+        pr["expect"]  = "The response contains 49 (7×7 evaluated) instead of the literal text — code execution."
+    elif t in ("LFI", "SSRF", "Command Injection", "NoSQL Injection", "XPath Injection",
+               "LDAP Injection", "Open Redirect", "CRLF Injection", "Hidden Parameter"):
+        pr["how"]     = f"The '{p or 'target'}' parameter accepts attacker-controlled input without validation."
+        pr["command"] = _curl_get(loc, p, pl) if p else "curl -sk " + _shq(loc)
+        pr["expect"]  = f"Observe the effect noted in the evidence: {ev}" if ev else "Observe the injection effect in the response."
+    elif t in ("Out-of-Band RCE", "Blind SSRF (OOB)", "Blind XXE (OOB)"):
+        pr["how"]     = "The target made an outbound request to the scanner's unique one-time listener URL."
+        pr["command"] = "# Confirmed out-of-band: the server fetched the scanner's unique OOB URL (see oob_events)."
+        pr["expect"]  = "A call-back was recorded from the target's IP — proving server-side fetch/execution."
+    elif t in ("Missing Header (HIGH)", "Missing Header (MEDIUM)", "Clickjacking",
+               "CORS Misconfiguration", "Insecure Cookie", "Missing Cache-Control"):
+        pr["how"]     = "The server's response headers were inspected."
+        pr["command"] = "curl -skI " + _shq(loc)
+        pr["expect"]  = f"The header issue is visible in the response headers: {ev}" if ev else "The insecure/missing header is visible in the output."
+    elif t in ("Weak JWT Secret",):
+        pr["how"]     = "The token's HMAC signing secret was recovered (see evidence)."
+        pr["command"] = ("python3 - <<'PY'\n"
+                         "import jwt  # pip install pyjwt\n"
+                         "print(jwt.encode({'user':'admin','role':'admin'}, '<SECRET_FROM_EVIDENCE>', algorithm='HS256'))\n"
+                         "PY")
+        pr["expect"]  = "A forged admin token is produced and accepted by the app — proving trivial account takeover."
+    elif t in ("Backup File Exposed", "Source Code Disclosure", "Sensitive File Exposed",
+               "Directory Listing", "Forced Browsing", "Exposed API Documentation"):
+        pr["how"]     = "A resource that should not be public is directly reachable."
+        pr["command"] = "curl -sk " + _shq(loc)
+        pr["expect"]  = "The sensitive content is returned with HTTP 200 and no authentication required."
+    else:
+        pr["how"]     = f"Confirmed by the scanner: {ev}" if ev else "Confirmed by the scanner."
+        pr["command"] = "curl -sk " + _shq(loc)
+        pr["expect"]  = ev or "Observe the finding in the response."
+
+    if cves and t in ("Outdated Service CVE", "WordPress Vulnerability", "Drupal Vulnerability",
+                      "Joomla Vulnerability", "Log4Shell (JNDI)", "Out-of-Band RCE"):
+        pr["cves"] = cves[:4]
+    return pr
+
+
 def generate_poc(job):
-    """Builds a safe, reproduction-only Proof-of-Concept for each confirmed
-    finding (the exact request that demonstrates it) plus CVE references.
-    For remediation & verification — not weaponised tooling."""
-    job.log("Exploit/PoC engine: generating reproduction steps for findings...", "INFO")
+    """Proof engine: for each confirmed finding, build a reproducible proof —
+    the exact request, what to observe, and the concrete evidence — so an
+    evaluator can independently reproduce the result. For remediation &
+    verification, not weaponised tooling: proofs read a single confirming value,
+    never bulk data, and never modify the target."""
+    job.log("Proof engine: building reproducible proof-of-concept for each finding...", "INFO")
     cves = _cve_refs(job)
-    INJ = {"SQL Injection", "Reflected XSS", "LFI", "SSRF", "Command Injection",
-           "NoSQL Injection", "SSTI", "Expression Language Injection", "XPath Injection",
-           "LDAP Injection", "Open Redirect", "CRLF Injection", "Hidden Parameter"}
     made = 0
     with job._lock:
         for v in job.vulns:
-            t = v["type"]; loc = v["location"]; p = v.get("parameter", ""); pl = v.get("payload", "")
-            poc = ""
-            if t in INJ and p and pl:
-                sep = "&" if "?" in loc else "?"
-                poc = (f"# Reproduce ({t}) — payload was confirmed by the scanner\n"
-                       f"curl -G '{loc}' --data-urlencode '{p}={pl}'\n"
-                       f"# Expected: the response shows the injection effect noted in evidence.")
-            elif t in ("Out-of-Band RCE", "Blind SSRF (OOB)", "Blind XXE (OOB)"):
-                poc = (f"# {t} — confirmed via out-of-band call-back to the scanner's listener.\n"
-                       f"# The target fetched our unique OOB URL, proving server-side execution/fetch.")
-            elif t in ("Missing Header (HIGH)", "Missing Header (MEDIUM)", "Clickjacking",
-                       "CORS Misconfiguration", "Insecure Cookie"):
-                poc = (f"# Verify ({t}) — inspect the response headers:\n"
-                       f"curl -sI '{loc}'")
-            elif t in ("Weak JWT Secret",):
-                poc = ("# Forge a token once the HMAC secret is known (see evidence):\n"
-                       "# python: jwt.encode({'user':'admin','role':'admin'}, '<secret>', algorithm='HS256')")
-            elif t in ("Backup File Exposed", "Source Code Disclosure", "Sensitive File Exposed",
-                       "Directory Listing", "Forced Browsing"):
-                poc = f"# Fetch the exposed resource:\ncurl -s '{loc}'"
-            elif t in ("Mass Assignment",):
-                poc = (f"# Send protected fields in the body:\n"
-                       f"curl -s '{loc}' -H 'Content-Type: application/json' "
-                       f"-d '{{\"role\":\"admin\",\"is_admin\":true}}'")
-            else:
-                poc = f"# Verify ({t}):\ncurl -s '{loc}'"
-            if cves and t in ("Outdated Service CVE", "WordPress Vulnerability",
-                              "Drupal Vulnerability", "Log4Shell (JNDI)", "Out-of-Band RCE"):
-                poc += f"\n# Related CVE references: {', '.join(cves[:4])}"
-            v["poc"] = poc
+            proof = _proof_for(job, v, cves)
+            v["proof"] = proof
+            # Keep a flat text PoC too (backward-compatible with older readers).
+            lines = [f"# {v['type']} — {proof['how']}".rstrip(),
+                     proof["command"],
+                     f"# Expect: {proof['expect']}"]
+            if proof["browser"]:
+                lines.append(f"# Browser proof (open to see the alert popup): {proof['browser']}")
+            if proof["cves"]:
+                lines.append(f"# Related CVEs: {', '.join(proof['cves'])}")
+            v["poc"] = "\n".join(lines)
             made += 1
-    job.log(f"Exploit/PoC engine: {made} reproduction PoC(s) generated"
+    job.log(f"Proof engine: {made} reproducible proof(s) generated"
             + (f" | CVE refs: {', '.join(cves[:4])}" if cves else ""), "OK")
 
 
@@ -4827,6 +4909,7 @@ input[type=text]:focus{border-color:var(--cy)}
   <div class="vl" id="vl"></div>
   <a href="/" class="bna">← New Scan</a>
   <a href="#" class="dlb" id="htmlr" target="_blank" style="background:#bc8cff18;border-color:#bc8cff50;color:var(--mg)">📄 HTML Report</a>
+  <a href="#" class="dlb" id="proofr" style="background:#3fb95018;border-color:#3fb95050;color:var(--gn)">🧪 Proof Pack</a>
   <a href="#" class="dlb" id="dl">⬇ Download JSON Report</a>
   <a href="#" class="dlb" id="apil" target="_blank" style="background:#388bfd18;border-color:#388bfd50;color:var(--cy)">⧉ Open JSON (API)</a>
 </div>
@@ -4997,6 +5080,8 @@ function showRes(d){
   if(api)api.href='/report/'+sid+'.json';
   const hr=document.getElementById('htmlr');
   if(hr)hr.href='/report/'+sid+'.html';
+  const pr=document.getElementById('proofr');
+  if(pr)pr.href='/proof/'+sid+'.md';
 }
 function tf(n){var e=document.getElementById('fd'+n);e.style.display=e.style.display==='block'?'none':'block';}
 function tf2(n){var e=document.getElementById('pc'+n);e.style.display=e.style.display==='block'?'none':'block';}
@@ -5100,6 +5185,10 @@ h2{font-size:1rem;margin:26px 0 12px;color:#e6edf3;border-left:3px solid #58a6ff
   font-size:.7rem;color:#e6edf3;white-space:pre-wrap;word-break:break-all;overflow-x:auto}
 .fix{margin:2px 0 8px 18px;font-size:.76rem;color:#c9d1d9}.fix li{margin-bottom:2px}
 .imp{font-size:.72rem;color:#d29922;background:#d2992212;border-radius:6px;padding:6px 10px;margin-top:6px}
+.expect{font-size:.74rem;color:#3fb950;background:#3fb95012;border:1px solid #3fb95035;border-radius:6px;padding:6px 10px;margin:6px 0}
+.expect b{color:#3fb950}
+.bproof{font-size:.72rem;color:#bc8cff;word-break:break-all;margin:4px 0 2px}
+.bproof a{color:#bc8cff}
 .chain{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px}
 .chain li{font-size:.78rem;color:#bc8cff;margin-bottom:6px;list-style:none;padding-left:16px;position:relative}
 .chain li:before{content:'⛓';position:absolute;left:-2px}
@@ -5151,8 +5240,22 @@ def render_html_report(rep):
         c = SC.get(v["severity"], "#8b949e")
         code = (f'<div class="lbl">Vulnerable code (where the issue is)</div>'
                 f'<pre class="code">{esc(v["code"])}</pre>') if v.get("code") else ""
-        poc = (f'<div class="lbl">Proof of Concept (reproduce)</div>'
-               f'<pre class="code">{esc(v["poc"])}</pre>') if v.get("poc") else ""
+        pf = v.get("proof") or {}
+        if pf.get("command"):
+            poc = f'<div class="lbl">Proof of Concept — run this to reproduce</div>' \
+                  f'<pre class="code">{esc(pf["command"])}</pre>'
+            if pf.get("expect"):
+                poc += f'<div class="expect"><b>Expected result:</b> {esc(pf["expect"])}</div>'
+            if pf.get("browser"):
+                poc += (f'<div class="bproof">Visual proof (open in a browser): '
+                        f'<a href="{esc(pf["browser"])}">{esc(pf["browser"])}</a></div>')
+            if pf.get("cves"):
+                poc += f'<div class="bproof">Related CVEs: {esc(", ".join(pf["cves"]))}</div>'
+        elif v.get("poc"):
+            poc = (f'<div class="lbl">Proof of Concept (reproduce)</div>'
+                   f'<pre class="code">{esc(v["poc"])}</pre>')
+        else:
+            poc = ""
         fixes = "".join(f"<li>{esc(x)}</li>" for x in v.get("fix", []))
         prm = f' · param: {esc(v["parameter"])}' if v.get("parameter") else ""
         cards += (f'<div class="finding" style="border-left:3px solid {c}">'
@@ -5219,6 +5322,56 @@ def render_html_report(rep):
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>PHANTOM Report — {esc(rep["host"])}</title>'
             f'<style>{_REPORT_CSS}</style></head><body>{head}{body}</body></html>')
+
+
+# ══ PROOF PACK (reproducible, copy-paste evidence) ═══════════════════════════
+def render_proof_pack(rep):
+    """A copy-paste 'Proof Pack' in Markdown: for each finding, the single
+    command that reproduces it and exactly what to observe. This is the
+    practical, reproducible evidence an evaluator can run themselves — it pairs
+    with the JSON and HTML reports and answers 'prove the finding is real'."""
+    s = rep["summary"]
+    L = [f"# PHANTOM Proof Pack — {rep['target']}", "",
+         f"- **Scanner:** PHANTOM v{rep['version']}",
+         f"- **Target:** {rep['target']}",
+         f"- **Generated:** {rep['generated']}",
+         f"- **Risk:** {s['risk']} · {s['total_findings']} finding(s) "
+         f"(C:{s['critical']} H:{s['high']} M:{s['medium']} L:{s['low']})",
+         "",
+         "> Each finding lists one copy-paste command and the exact result to look for. "
+         "Run these **only** against systems you own or are explicitly authorized to test. "
+         "Proofs read a single confirming value — they do not dump bulk data or modify the target.",
+         ""]
+    vulns = rep.get("vulnerabilities", [])
+    if not vulns:
+        L.append("_No vulnerabilities were confirmed — nothing to reproduce._")
+        return "\n".join(L)
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4}
+    vulns = sorted(vulns, key=lambda v: order.get(v.get("severity", "NONE"), 4))
+    for i, v in enumerate(vulns, 1):
+        pr = v.get("proof") or {}
+        L.append(f"## {i}. [{v['severity']}] {v['type']}")
+        L.append("")
+        where = f"- **Where:** `{v.get('location','')}`"
+        if v.get("parameter"):
+            where += f" · parameter `{v['parameter']}`"
+        L.append(where)
+        L.append(f"- **CVSS:** {v.get('cvss','')} · {v.get('cwe','')} · {v.get('owasp','')}")
+        if pr.get("how"):
+            L.append(f"- **How it was confirmed:** {pr['how']}")
+        if pr.get("evidence"):
+            L.append(f"- **Evidence:** {pr['evidence']}")
+        L += ["", "**Reproduce (copy-paste):**", "", "```bash",
+              pr.get("command") or ("curl -sk " + _shq(v.get("location", ""))), "```", ""]
+        if pr.get("expect"):
+            L += [f"**Expected result:** {pr['expect']}", ""]
+        if pr.get("browser"):
+            L += [f"**Visual proof — open in a browser:** {pr['browser']}", ""]
+        if pr.get("cves"):
+            L += [f"**Related CVEs:** {', '.join(pr['cves'])}", ""]
+        L += ["---", ""]
+    L.append(f"_Generated by PHANTOM v{rep['version']} — reproduction / verification proof pack._")
+    return "\n".join(L)
 
 
 # ══ FLASK ROUTES ══════════════════════════════════════════════════════════════
@@ -5302,6 +5455,20 @@ def report_html(sid):
         return "Not found", 404
     return render_html_report(job_report(job))
 
+@app.route("/proof/<sid>")
+@app.route("/proof/<sid>.md")
+def proof_pack(sid):
+    """Reproducible 'Proof Pack' (Markdown): a copy-paste command + expected
+    result per finding — the practical evidence an evaluator can run."""
+    job = scans.get(sid)
+    if not job:
+        return "Not found", 404
+    body  = render_proof_pack(job_report(job))
+    fname = f"phantom_proof_{job.host.replace(':','_')}_{sid}.md"
+    return app.response_class(
+        body, mimetype="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
 @app.route("/oob/<token>", defaults={"rest": ""})
 @app.route("/oob/<token>/<path:rest>")
 def oob_collect_endpoint(token, rest):
@@ -5333,6 +5500,8 @@ CLI / TERMUX (headless, writes a JSON report):
   python phantom.py <url>                     # scan and save phantom_<host>_<id>.json
   python phantom.py <url> -o report.json      # choose the output file
   python phantom.py <url> --html              # also write a professional HTML report
+  python phantom.py <url> --proof             # also write a copy-paste Proof Pack (.md)
+  python phantom.py <url> --all               # write JSON + HTML + Proof Pack together
   python phantom.py <url> --quiet             # only print the final summary
   python phantom.py <url> --print             # also echo the JSON to the screen
 
@@ -5344,12 +5513,42 @@ AUTHENTICATED SCAN (test protected areas):
 Only scan systems you own or are explicitly authorized to test.
 """
 
+def _preflight(url, timeout=8):
+    """Quick reachability check before a full scan: resolve DNS, then try one
+    lightweight request. Returns (ok, reason) so the CLI can fail fast with a
+    clear, actionable message instead of grinding through an unreachable host."""
+    host = urlparse(url).hostname
+    if not host:
+        return False, "could not parse a hostname from the URL"
+    try:
+        socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False, f"DNS lookup failed for '{host}' (host not found / no internet)"
+    except Exception as e:
+        return False, f"DNS error for '{host}': {str(e)[:80]}"
+    try:
+        h = realistic_headers(random.choice(UAS))
+        r = http().request("GET", url, headers=h, timeout=timeout,
+                           verify=False, allow_redirects=True, stream=True)
+        r.close()
+        return True, f"reachable (HTTP {r.status_code})"
+    except requests.exceptions.SSLError:
+        return True, "reachable (TLS warning ignored)"   # scanner tolerates cert issues
+    except requests.exceptions.ConnectTimeout:
+        return False, "connection timed out (host online but not responding)"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"connection refused/failed ({str(e)[:70]})"
+    except Exception as e:
+        return False, f"request failed ({str(e)[:80]})"
+
+
 def _cli_main(argv):
     """Headless scan for terminals/Termux: runs the full engine, streams the
     live log, then writes a clean JSON report file. No browser needed."""
     if argv[0] in ("-h", "--help", "help"):
         print(USAGE); return
-    url = None; out = None; quiet = False; echo = False; want_html = False
+    url = None; out = None; quiet = False; echo = False
+    want_html = False; want_proof = False
     auth = {}
     i = 0
     while i < len(argv):
@@ -5362,6 +5561,10 @@ def _cli_main(argv):
             echo = True
         elif a == "--html":
             want_html = True
+        elif a == "--proof":
+            want_proof = True
+        elif a == "--all":
+            want_html = want_proof = True
         elif a in ("--cookie", "--bearer", "--login-url", "--login-data"):
             key = a.lstrip("-").replace("-", "_")
             i += 1
@@ -5369,11 +5572,25 @@ def _cli_main(argv):
                 auth[key] = argv[i]
         elif not a.startswith("-") and url is None:
             url = a
+        elif a.startswith("-"):
+            print(f"[!] Unknown option: {a}\n"); print(USAGE); sys.exit(2)
         i += 1
     if not url:
         print(USAGE); sys.exit(1)
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Preflight: fail fast with a clear, actionable message (Termux-friendly)
+    # instead of running a full scan against an unreachable/mistyped target.
+    ok, why = _preflight(url)
+    if not ok:
+        print(f"[!] Cannot reach target: {url}")
+        print(f"    Reason: {why}")
+        print( "    Fixes:  • check the URL spelling and http/https prefix")
+        print( "            • confirm the site is online (open it in a browser)")
+        print( "            • on Termux: `pkg install python`, then `pip install -r requirements.txt`")
+        print( "            • no internet? connect to a network and retry")
+        sys.exit(3)
 
     job = ScanJob(url)
     if auth:
@@ -5403,14 +5620,25 @@ def _cli_main(argv):
     except Exception as e:
         print(f"[!] Could not write {out}: {e}"); out = None
 
+    stem = (out[:-5] if out and out.endswith(".json") else out or "phantom_report")
+
     html_out = None
     if want_html:
-        html_out = (out[:-5] if out and out.endswith(".json") else out or "phantom_report") + ".html"
+        html_out = stem + ".html"
         try:
             with open(html_out, "w") as f:
                 f.write(render_html_report(report))
         except Exception as e:
             print(f"[!] Could not write {html_out}: {e}"); html_out = None
+
+    proof_out = None
+    if want_proof:
+        proof_out = stem + "_proof.md"
+        try:
+            with open(proof_out, "w") as f:
+                f.write(render_proof_pack(report))
+        except Exception as e:
+            print(f"[!] Could not write {proof_out}: {e}"); proof_out = None
 
     s = report["summary"]
     print(f"\n[✓] Done in {job.elapsed}s — {s['total_findings']} findings "
@@ -5418,9 +5646,11 @@ def _cli_main(argv):
     if s["attack_chains"]:
         print(f"[✓] {s['attack_chains']} attack chain(s) correlated")
     if out:
-        print(f"[✓] JSON report written: {out}")
+        print(f"[✓] JSON report written:  {out}")
     if html_out:
-        print(f"[✓] HTML report written: {html_out}")
+        print(f"[✓] HTML report written:  {html_out}")
+    if proof_out:
+        print(f"[✓] Proof Pack written:   {proof_out}  (copy-paste evidence for reviewers)")
     if echo:
         print("\n" + json.dumps(report, indent=2, default=str))
 
@@ -5429,7 +5659,18 @@ if __name__ == "__main__":
     _args = sys.argv[1:]
     # A target argument switches to headless CLI/Termux mode; otherwise serve web.
     if _args and _args[0] not in ("serve", "web", "runserver"):
-        _cli_main(_args)
+        try:
+            _cli_main(_args)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted by user — partial results were not saved.")
+            sys.exit(130)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"\n[!] Unexpected error: {e}")
+            print("    If this persists, re-run with a single simple URL to isolate the issue,")
+            print("    e.g.  python phantom.py http://testphp.vulnweb.com/")
+            sys.exit(1)
     else:
         print(f"[*] PHANTOM v{VER} starting on port {PORT}")
         print(f"[*] 72 modules | HTML/JSON reports | OWASP+CWE | real-browser | pooling | FAST={FAST}")
